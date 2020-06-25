@@ -389,23 +389,6 @@ function:
                   returned. This is implimented for debug purposes only.
 
 See: @telnet, telnet_open()
-& @telnet
-command:
-
-   @telnet <hostname> <port>
-
-   Opens a connection to <hostname> on <port> if the object is set either
-   SOCKET_PUPPET or SOCKET_INPUT. Both flags are setable by WIZARDS only.
-
-   If the object is set SOCKET_PUPPET, all socket input is matched via a
-   ^pattern style listen used by MUSH to match input in the same room as
-   an object. However, instead of a "^" the pattern must start with "!"
-   to specify a socket based listen.
-
-   If the object is set SOCKET_LISTEN, then all socket input may be
-   retrieved by the input() / telnet_open functions.
-
-See: input(), telnet_open(), SOCKET_PUPPET, SOCKET_INPUT, @close
 &url
 function:
 
@@ -1881,3 +1864,196 @@ TRAIN
 
   The first two lines resulting in the Huh? and #-1 are the output
   from the +fun command when run by the user.
+& @motd
+  COMMAND: @motd[/<switches>] <message>
+
+  This command sets or lists short messages that are displayed to players
+  after they successfully log in to the game (or after they fail because
+  logins are not allowed). 
+
+  The following switches are available:
+
+     (No switches)   - Sets the message that all players see when they
+                       connect.
+     /list           - Lists the current messages.
+& locate()
+  FUNCTION: locate(<looker>,<string>,<where>)
+
+  The locate function is used to look for an object from the perspective of
+  <looker> (You must own <looker>).  The database number of the item that
+  is found is returned.  The <where> parameter specifies a list of places to
+  look, from this list:
+    a    - Look for absolute references (#<number>)
+    c    - Look for exits carried by <looker> (and by <looker>'s parents).
+    e    - Look for exits in <looker>'s location (and the location's parents).
+    h    - Look for 'here', which matches <looker>'s location.
+    i    - Look in <looker>'s inventory.
+    m    - Look for 'me', which matches <looker>.
+    n    - Look for <looker>'s neighbors (other objects in the same location).
+    p    - Look for player names prefixed by a '*'
+    *    - Look for everything in the above list.
+
+{ 'help locate2' for more }
+& locate2
+LOCATE() (continued)
+
+  You may also specify qualifiers in <where> to help resolve possible
+  ambiguities:
+    E    - Prefer exits over other types.
+    L    - Prefer unlocked exits over locked exits.
+    P    - Prefer players over other types.
+    R    - Prefer rooms over other types.
+    T    - Prefer things over other types.
+    V    - Report "Can't find..." and "Which one..." errors to <looker>.
+    X    - Select randomly if search finds multiple matches.
+
+  If nothing matches, the value #-1 is returned.  If more than one thing
+  of the preferred type matches, but nothing matches exactly, the value #-2
+  is returned, except if the X qualifier was specified in which case one is
+  chosen at random.  If more than one thing exactly matches, one is chosen
+  at random.  If you specify more than one type preference (E, P, R, or T),
+  then the last one entered is the one that is obeyed.  The default is for
+  no type to be preferred.
+
+{ 'help locate3' for more }
+& locate3
+LOCATE() (continued)
+
+  Examples:
+    > i
+    test1(#378)
+    test(#376)
+    You have 42463 clams.
+    > look
+    Nullspace(#250R)
+    test1(#382)
+    > say locate(me,test,i)                > say locate(me,tes,in)
+    You say, "#376"                         You say, "#-2"
+    > say locate(me,test,n)                > say locate(here,tes,*)
+    You say, "#382"                         You say, "#382"
+    > say locate(me,test1,in)              > say locate(me,out,e)
+    You say, "#378"                         You say, "#252"
+    > say locate(me,test1,in)              > say locate(me,here,*)
+    You say, "#382"                         You say, "#250"
+
+  Related Topics: num(), PARENT OBJECTS.
+& @chown
+
+  COMMAND: @chown <thing>
+           @chown <thing> = <player>
+
+  This command allows you to change the ownership of things with the below
+  restrictions. Once the ownership has been changed, the object will be set
+  HALTED.
+
+  Restrictions:
+     1. The thing must be set CHOWN_OK.
+     2. The thing can not be a PLAYER.
+     3. If the thing is an OBJECT, then you must be carrying the OBJECT
+        to @chown it.
+     4. If the thing is a ROOM, you must be in the room to @chown it.
+     5. If the thing is an EXIT, you must be in the same room as the exit.
+     6. If you are trying to @chown an object to someone else, you must be
+        a Wizard / God.
+& @function
+
+  COMMAND: @function/list
+           @function <name> = <object> / <attribute>
+
+  This command is used to manage user defined functions by either listing
+  them or defining them to point to a object and attribute. User defined
+  @functions will not survive a reboot of the MUSH and must be re-added.
+
+  The functionalty of user defined functions is similar to the use of
+  the u() function.
+
+  Example:
+     &foo #1 = [add(1,0)]
+     > @function bar = #1/foo
+     > say [bar(1)]
+     You say, "2"
+     > say [u(#1/foo,1)]
+     You say, "2"
+
+  The use of [bar(1)] is similar to [u(#1/foo,1)] in the above situation.
+& @stats
+
+  COMMAND: @stats[/all] [<player>]
+
+  Display the number of objects in the game.  @stats/all gives a
+  breakdown by object types.  If <player> is specified, the breakdown
+  for the named player is given.  You may only list individual counts
+  for yourself.  If invoked with no arguments or switches this command is
+  free, but if you specify either /all or <player>, then this command costs
+  100 coins to run, because it is computationally expensive.
+
+  Related Topics: stats().
+& look
+
+  COMMAND: look[/<switches>] [<object>]
+
+  Displays the description of <object>, or the room you're in if you don't
+  specify an object.  Specifying object as <name> or #<dbref> or 'me' or
+  'here' is legal.  You can also use look to look at objects held by other
+  people, just use 'look <person>'s <object>'.
+
+& @uptime
+
+  COMMAND: @uptime
+
+  Lists how long the MUSH has been up in days, hour, and minutes.
+& @sex
+  COMMAND:   @sex <object> = <gender>
+  ATTRIBUTE: Sex
+
+  Sets the gender for <object>, which is used to determine which pronouns to
+  use when replacing %p, %o, %s, and %a parameters in messages that apply to
+  <object>.  Genders that start with M or m are considered male, those
+  starting with F, f, W, or w are considered female, those starting with
+  P or p are considered plural, and anything else is considered neuter.
+
+  Example: @sex me = female
+           @sex me = No thank you (Silly, but possible.  Treated as neuter)
+& version
+
+  COMMAND: version
+
+  Displays the version of MUSH other tidbits.
+& @send
+  COMMAND:   @send <message>
+
+  This command is used to send a message over an already open @telnet
+  connection. Since only one connection is allowed per object, there is
+  no need to specify which connection to use.
+
+  Related Topics: @telnet
+& @telnet
+  COMMAND:   @telnet <host>:<port>
+
+  This command will open up a connection to a host at the specified port.
+  The object issueing the @telnet command must be set SOCKET_PUPPET or
+  SOCKET_INPUT. Both flags may only be set by Wizards / God. These two
+  flags control only how data is recieved. See below.
+
+  SOCKET_PUPPET
+     Input from the socket is handled in a way similar to the user defined
+     attribute listens. I.e. "&attribute object = ^* has arrived.". The only
+     differences is that the "^" is replaced with a "!" to signify the
+     object is listening to @telnet data.
+
+  SOCKET_INPUT
+     The input from @telnet is availible via the input() function and
+     the function must be called once for each line of input coming from
+     the connection. See help input() for more details. This allows a more
+     controlled way of dealing with input but can also be more complicated.
+
+  Sending Data
+     Data for both types are sent via @send <message>
+
+  Related Topics: @close, @send, flags
+
+& @nohelp
+  COMMAND:   @nohelp
+
+  This command lists @commands or functions() without any help.
+  This is useful for determing which things need help entries written.
