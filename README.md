@@ -1,10 +1,9 @@
-# TeenyMUSH
-This is a full implementation of a TinyMUSH like server in Perl. The server can
-be used to create an ASCII based virtual world. Users can telnet into the
-server and interact with other users in a world of their creation.
-Customization of the world does not require modification of the internal
-server code. 
-
+﻿# TeenyMUSH
+This is a full implementation of a TinyMUSH like server in Perl. The server
+can be used to create an ASCII based virtual world of your own.  Customization
+of the world does not require modification of the server but instead uses
+internal commands documented in the help command. People can interact with
+other users via telnet, web, or websockets.
 
    1. Download teenymush.pl and help.txt
 ```
@@ -29,5 +28,5 @@ server code.
 
 # Setup
 
-See: http://ascii.dynu.net/FAQ or 
-     http://ascii.dynu.net/ for more details.
+See: https://teenymush.dynu.net/FAQ or 
+     https://teenymush.dynu.net/ for more details.

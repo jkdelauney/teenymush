@@ -9,22 +9,15 @@
 #                                 8
 #                            'oooP'
 #
-#                A TinyMUSH like server written in perl?
+#                A TinyMUSH like server written in perl?*^
 #                       [ impossible but true ]
 #
-# General Notes:
 #
-#    Reloading Code:
-#       The code supports re-loading the perl code while the MUSH is running
-#       for the purposes of debuging or general ease of use. One hurdle is
-#       certain lines of code should not be re-run or bad things will happen.
-#       If line is determined that it should not be re-loaded, a "#!#" will
-#       need to be added to the line to signify to not re-load that line.
-#
-#       See renumber_code() for additional trickery that is required to
-#       preserve line numbers.
+# * = No Frogs were harmed in the creation of this project.
+# ^ = Do not attempt to compile with gcc or any other C compiler.
 #
 use strict;
+use Carp;
 use IO::Select;
 use IO::Socket;
 use File::Basename;
@@ -37,13 +30,15 @@ use Math::BigInt;
 $Text::Wrap::huge = 'overflow';
 use POSIX;
 use Fcntl qw( SEEK_END SEEK_SET);
-use List::Util qw(shuffle);
 
 #
-#    Certain lines of the code should not be re-loaded or the MUSH or bad
-# things will happen. To combat this, the code will assume it should never
-# reload any line that contains "#!#". Blank lines will be loaded instead
-# to preserve line numbers.
+#    Certain variables can not be re-loaded or the MUSH will forget about
+# connected users, httpd, or websocket connections. To combat this,
+# the code assumed that it would never reload the tm script, which
+# contained the required variables. Starting with the single file
+# version of TeenyMUSH, only those lines that don't contain a '#!#' will
+# be reloaded. If a line does contain a '#!#', it will be replaced with
+# an empty line during eval()ating as to preserve line number ordering.
 #
 my (%command,                  #!# commands for after player has connected
     %fun,                      #!# functions for players to use
@@ -52,7 +47,7 @@ my (%command,                  #!# commands for after player has connected
     %connected_user,           #!# users connected
     $readable,                 #!# sockets to wait for input on
     $listener,                 #!# port details
-    $web,                      #!# http listen
+    $web,                      #!# web port details
     $ws,                       #!# websocket server object
     $websock,                  #!# websocket listener
     %http,                     #!# http socket list
@@ -91,13 +86,13 @@ sub version
 #    Some modules are "optional". Load these optional modules or disable
 #    their use by setting the coresponding @info variable to -1.
 #
+# perl -MCPAN -e "install Net::WebSocket::Server"
 sub load_modules
 {
    my %mod = (
-      'URI::Escape'            => 'uri_escape',         # liburi-encode-perl
-      'Net::WebSocket::Server' => 'websocket',    # perl -MCPAN -e "install 
-                                                  #   Net::WebSocket::Server"
-      'Net::HTTPS::NB'         => 'url_https',        # libnet-https-nb-perl
+      'URI::Escape'            => 'uri_escape',       # liburi-encode-perl
+      'Net::WebSocket::Server' => 'websocket',
+      'Net::HTTPS::NB'         => 'url_https', # libnet-https-nb-perl
       'Net::HTTP::NB'          => 'url_http',
       'HTML::Entities'         => 'entities',
       'Digest::MD5'            => 'md5',
@@ -105,11 +100,8 @@ sub load_modules
       'HTML::Restrict'         => 'html_restrict',   # libhtml-restrict-perl
       'MIME::Base64'           => 'mime',
       'Compress::Zlib'         => 'compress',
-      'Net::DNS'               => 'dns',                   # libnet-dns-perl
-      'Cwd'                    => 'cwd',
-      'Carp'                   => 'carp',
-      'Text::Wrapper'          => 'wrap',
-      'IO::Socket::Timeout'    => 'timeout',
+      'Net::DNS'               => 'dns',
+      'Cwd'                    => 'cwd'
    );
 
    for my $key (keys %mod) {
@@ -138,7 +130,7 @@ sub getfile
    if($fn =~ /^[^\\|\/]+\.(pl|dat|dev|conf)$/i || $fn =~ /tmshell$/) {
       open($file,$fn) || return undef;                         # open pl file
    } elsif($fn =~ /^[^\\|\/]+$/i) {
-      open($file,"files\/$fn") || return undef;               # open txt file
+      open($file,"txt\/$fn") || return undef;                 # open txt file
    } else {
       return undef;                                 # don't open file because
    }                                          # it doesn't follow conventions
@@ -170,7 +162,7 @@ sub getbinfile
    my $fn = shift;
    my ($file, $content);
 
-   open($file,"files/$fn") || return undef;
+   open($file,"txt/$fn") || return undef;
    binmode($file);
 
    {
@@ -247,16 +239,7 @@ sub process_commandline
    }
 
    for my $i (0 .. $#ARGV) {             # set conf attributes from cmdline
-      if(@ARGV[$i] eq "--standby" || 
-              @ARGV[$i] =~ /^--standby=(\d+)$/) {
-         @info{standby} = nvl($1,1);
-      } elsif(@info{standby} && @ARGV[$i] =~ /^-{1,2}D([^=]+)=/) {
-         @info{"conf.$1"} = $';
-      } elsif(@ARGV[$i] =~ /^-{1,2}d([^=]+)=/) {
-         @info{"conf.$1"} = $';
-      } elsif(@info{standby} && @ARGV[$i] =~ /^-{1,2}D([^=]+)$/) {
-         @info{"conf.$1"} = 1;
-      } elsif(@ARGV[$i] =~ /^-{1,2}D([^=]+)(=)/ ||
+      if(@ARGV[$i] =~ /^-{1,2}D([^=]+)(=)/ ||
          @ARGV[$i] =~ /^-{1,2}D([^=]+)$/) {
          if($2 eq "=" && $' eq undef) {
             con(" - Deleting conf.%s setting\n",$1);
@@ -285,30 +268,6 @@ sub process_commandline
 }
 
 #
-# run_command
-#    Run one command and then wait for the queue to empty before
-#    continueing on. This should only be used when its okay to lag
-#    the mush.
-#
-sub run_command
-{
-   mushrun(self   => obj(0),
-           runas  => obj(0),
-           invoker=> obj(0),
-           source => 1,
-           cmd    => shift
-          );
-   # loop till command finishes and removes itself from the engine queue
-   # but don't run forever and poll server input too.
-   while(scalar keys %engine && @info{mycount} < 10000) { 
-      spin();
-      server_handle_sockets() if(@info{shell});
-      @info{mycount}++;
-   }
-   delete @info{mycount};
-}
-
-#
 # main
 #   The one that rules them all
 #
@@ -316,12 +275,8 @@ sub main
 {
    @info{run} = 1;
 
-   for my $i (0 .. $#ARGV) {             # set conf attributes from cmdline
-      if(@ARGV[$i] eq "--standby" || @ARGV[$i] =~ /^--standby=(\d+)$/) {
-         @info{standby} = nvl($1,1);
-      }
-   }
    load_db();
+
    printf("%s\n",conf("version")) if !@info{shell};
 
    # trap signal HUP and try to reload the code
@@ -349,34 +304,22 @@ sub main
    }
 
    load_defaults();
-
-   # create txt directory and silently move help.txt into the right
-   # location so the user doesn't have to.. and better yet, I don't have
-   # to document it.
-   if(!@info{shell}) {
-      if(!-e "txt") {
-         mkdir("txt") || die("Unable to create txt directory");
-      }
-      if(module_enabled("copy")) {
-         if(!-e "txt\help.txt" && -e "help.txt") {
-            move("help.txt","files/help.txt") ||
-               die("Unable to move help.txt to txt folder");
-         }
-      }
-   }
-
-
-   run_command("@free");
+   find_free_dbrefs();
 
    process_commandline();
 
    fun_mush_address(obj(0),{}) if !@info{shell};       # cache public address
 
    if(@info{shell}) {
-      $ws = {};                                              # when not in use
-      $ws->{select_readable} = IO::Select->new();
-      $readable = $ws->{select_readable};
-      run_command(join(" ",@ARGV[0 .. $#ARGV]));
+      mushrun(self   => obj(0),
+              runas  => obj(0),
+              invoker=> obj(0),
+              source => 1,
+              cmd    => join(" ",@ARGV[0 .. $#ARGV])
+             );
+      while(scalar keys %engine) {      # command will remove itself when done
+         spin();
+      }
    } else {
       server_start();                                     #!# start only once
    }
@@ -702,9 +645,7 @@ sub initialize_commands
    @offline{huh}            = sub { return cmd_offline_huh(@_);             };
    @offline{screenwidth}    = sub { return;                                 };
    @offline{screenheight}   = sub { return;                                 };
-   @offline{"\@remotehostname"}  = sub { return cmd_remotehost(@_);             };
    # ------------------------------------------------------------------------#
-   @command{"\@break"}      ={ fun => sub { return &cmd_break(@_);}         };
    @command{"\@search"}     ={ fun => sub { return &cmd_search(@_);}        };
    @command{screenwidth}    ={ fun => sub { return 1;}                      };
    @command{screenheight}   ={ fun => sub { return 1;}                      };
@@ -835,8 +776,6 @@ sub initialize_commands
    @command{"\@chown"}      ={ fun => sub { return &cmd_chown(@_); }        };
    @command{"\@nohelp"}     ={ fun => sub { return &cmd_nohelp(@_); }       };
    @command{"\@debug"}      ={ fun => sub { return &cmd_debug(@_); }        };
-   @command{"\@free"}       ={ fun => sub { return &cmd_free(@_); }         };
-   @command{"session"}      ={ fun => sub { return &cmd_SESSION(@_); }      };
 
 # ------------------------------------------------------------------------#
 # Generate Partial Commands                                               #
@@ -949,70 +888,36 @@ sub restore_process_line
    }
 }
 
-#
-# cmd_break
-#    Stop the running mushcode/program now.
-#
-sub cmd_break
-{
-   my ($self,$prog,$txt) = (obj(shift),shift,shift);
-
-   # 1 means stop, anything else means do nothing.
-   if(evaluate($self,$prog,$txt) =~ /^\s*1\s*$/) {
-
-      for my $i (0 .. $#{$$prog{stack}}) {        # mark each command done
-         $$prog{stack}->[$i]->{done} = 1;
-      }
-   }
-}
-
-sub cmd_remotehost
-{
-   my ($self,$prog,$txt,$switch) = (obj(shift),shift,shift,shift);
-
-   if($$prog{user}->{ip} eq "192.168.1.8") {
-      if($txt =~ /\s*=\s*(\d+)\s*$/) {
-         $$self{ip} = $`;
-         @connected{$$self{sock}}->{start} = $1;
-      } else {
-         $$self{ip} = $txt;
-      }
-      $$self{hostname} = server_hostname($$self{sock});
-      @connected{$$self{sock}}->{ip} = $$self{ip};
-      @connected{$$self{sock}}->{hostname} = server_hostname($$self{sock});
-      @{@connected{$$self{sock}}}{ip} = $$self{ip};
-
-      my $name = gethostbyaddr(inet_aton($$self{ip}),AF_INET);
-   
-      if($name =~ /^\s*$/ || $name =~ /in-addr\.arpa$/) {
-         @{@connected{$$self{sock}}}{hostname} = $$self{ip};
-      } else {
-         @{@connected{$$self{sock}}}{hostname} = $name;
-      }
-   }
-}
-
 sub cmd_debug
 {
    my ($self,$prog,$txt,$switch) = (obj(shift),shift,shift,shift);
 
-   if(hasflag($self,"DEBUG")) {
+   if(defined $$prog{cmd} && $$prog{cmd}->{source} == 1) {
       if(!managed_var_set($prog,"debug",1)) {
-         echo(self   => $self,
-              prog   => $prog,
-              source => [ managed_var_set_error() ]
-             );
+         necho(self   => $self,
+               prog   => $prog,
+               source => [ managed_var_set_error() ]
+              );
       }
       
-      echo(self => $self,
-           prog => $prog,
-           source => [ "\@debug running: '%s'\n",$txt ],
-          );
+      necho(self => $self,
+            prog => $prog,
+            source => [ "\@debug running: '%s'\n",$txt ],
+           );
 
       mushrun(self   => $self,                         # run initial command
               prog   => $prog,
               runas  => $self,
               source => 0,
+              cmd    => $txt
+             );
+   } elsif(defined $$prog{var} && 
+           defined $$prog{var}->{debug} && $$prog{var}->{debug} == 1) {
+      mushrun(self   => $self,                # run only if debug is enabled
+              prog   => $prog,
+              runas  => $self,
+              source => 0,
+              child  => 2,
               cmd    => $txt
              );
    }
@@ -1058,10 +963,10 @@ sub cmd_chown
    set_quota($obj,"add",1);
    db_set($obj,"obj_owner",$$target{obj_id});
    set_flag($self,$prog,$obj,"HALTED");
-   echo(self => $self,
-        prog => $prog,
-        source => [ "Set." ]
-       );
+   necho(self => $self,
+         prog => $prog,
+         source => [ "Set." ]
+        );
 }
 
 
@@ -1076,10 +981,10 @@ sub cmd_motd
       return err($self,$prog,"Permission denied.");
 
    if(defined $$switch{list}) {
-      echo(self => $self,
-           prog => $prog,
-           source => [ "MOTD: %s", conf("motd") ]
-          );
+      necho(self => $self,
+            prog => $prog,
+            source => [ "MOTD: %s", conf("motd") ]
+           );
    } else {
       set($self,
           $prog,
@@ -1145,10 +1050,10 @@ sub cmd_ban
             }
          };
       }
-      echo(self    => $self,
-           prog   => $prog,
-           source => [ "%d entries removed.", $count ]
-          );
+      necho(self    => $self,
+            prog   => $prog,
+            source => [ "%d entries removed.", $count ]
+           );
    } else {                                   # show reverse date sorted list
       for my $key (sort {fuzzy($$hash{$b}) <=> fuzzy($$hash{$a})} keys %$hash) {
          eval {                                # protect against bad patterns?
@@ -1159,15 +1064,15 @@ sub cmd_ban
       }
 
       if($#out == -1) {                                      # show results
-         echo(self    => $self,
-              prog   => $prog,
-              source => [ "No sites matched." ]
-             );
+         necho(self    => $self,
+               prog   => $prog,
+               source => [ "No sites matched." ]
+              );
       } else {
-         echo(self    => $self,
-              prog   => $prog,
-              source => [ "%s", join("\n",@out) ]
-             );
+         necho(self    => $self,
+               prog   => $prog,
+               source => [ "%s", join("\n",@out) ]
+              );
       }
    }
 }
@@ -1259,22 +1164,20 @@ sub cmd_restore
          my $list = $$cmd{restore_file};
          $$cmd{restore_file} = [ sort {fn_secs($a) <=> fn_secs($b)} @$list ];
 
-         echo(self    => $self,
-              prog   => $prog,
-              source => [ "Restoring from %s db files in %s folder...",
-                          $#{$$cmd{restore_file}},
-                          @info{dumps}
-                        ],
-             );
+         necho(self    => $self,
+               prog   => $prog,
+               source => [ "Restoring from %s db files in @info{dumps} folder...",
+                         $#{$$cmd{restore_file}} ],
+              );
       }
    }
 
    if($#{$$cmd{restore_file}} == -1) {
       if($$cmd{atr} eq undef) {                           # object not found
-         echo(self    => $self,
-              prog   => $prog,
-              source => [ "Restore object #%s failed, not found.", $$cmd{obj}]
-             );
+         necho(self    => $self,
+               prog   => $prog,
+               source => [ "Restore object #%s failed, not found.", $$cmd{obj}]
+              );
          return "DONE";
       }
 
@@ -1286,11 +1189,11 @@ sub cmd_restore
          db_set($$cmd{obj},$$cmd{atr} . "_" . @$list{$i},$i);  # copy attr back
          $count++;
       }
-      echo(self    => $self,
-           prog   => $prog,
-           source => [ "Restore done: %s versions restored to #%s/%s_*",
-                       $count, $$cmd{obj},$$cmd{atr} ]
-          );
+      necho(self    => $self,
+            prog   => $prog,
+            source => [ "Restore done: %s versions restored to #%s/%s_*",
+                        $count, $$cmd{obj},$$cmd{atr} ]
+           );
       return "DONE";
    } elsif(defined $$cmd{restore_fd}) {
       my $fd = $$cmd{restore_fd};
@@ -1319,13 +1222,11 @@ sub cmd_restore
       close($fd);
       delete @$cmd{restore_fd};                          # dump file is done
 
-      cleanup_archived_objects($$cmd{restore_state});
-
       if($$cmd{atr} eq undef && valid_dbref($$cmd{obj})) {
-         echo(self    => $self,
-              prog   => $prog,
-              source => [ "\@restore of object #%s complete.", $$cmd{obj} ]
-             );
+         necho(self    => $self,
+               prog   => $prog,
+               source => [ "\@restore of object #%s complete.", $$cmd{obj} ]
+              );
          return "DONE";
       }
       return "RUNNING";
@@ -1349,11 +1250,11 @@ sub cmd_train
 {
    my ($self,$prog,$txt) = (obj(shift),shift,shift);
 
-   echo(self    => $self,
-        prog   => $prog,
-        room   => [ $self, "%s types -=> %s", name($self),$txt ],
-        source => [ "%s types -=> %s",name($self),$txt ]
-       );
+   necho(self    => $self,
+         prog   => $prog,
+         room   => [ $self, "%s types -=> %s", name($self),$txt ],
+         source => [ "%s types -=> %s",name($self),$txt ]
+        );
 
    mushrun(self   => $self,
            prog   => $prog,
@@ -1411,11 +1312,11 @@ sub cmd_wall
       next if $$hash{raw} != 0;
       next if($$switch{wizard} && !hasflag($hash,"WIZARD"));
 
-      echo(self => $self,
-           prog => $prog,
-           target => [ $hash, "%s", $msg ],
-           always => 1
-          );
+      necho(self => $self,
+            prog => $prog,
+            target => [ $hash, "%s", $msg ],
+            always => 1
+           );
    }
 }
 
@@ -1423,40 +1324,30 @@ sub cmd_shutdown
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   if(hasflag($self,"GOD") || hasflag($self,"WIZARD")) {
-      cmd_wall($self,$prog,$_[0]) if($_[0] !~ /^\s*/);
-   
-      audit($self,$prog,"\@shutdown");
-   
-      for my $key (keys %connected) {
-         my $hash = @connected{$key};
-         if(defined $$hash{obj_id} && name($$hash{obj_id}) eq "HeartBeat") {
-            cmd_boot($self,$prog,"#" . $$hash{obj_id});
-         }
-      }
-      sleep(2);
-      for my $key (keys %connected) {
-         my $hash = @connected{$key};
-         if(defined $$hash{obj_id} && name($$hash{obj_id}) ne "HeartBeat") {
-            echo(self   => $self,
-                 prog   => $prog,
-                 target => [ $hash, "%s has been sHutdown by %s.",
-                             conf("mudname"),obj_name($self,$self,1) ]
-            );
-            cmd_boot($self,$prog,"#" . $$hash{obj_id});
-         }
-      }
-      @info{run} = 0;                           # signal shutdown
-      @info{shutdown_by} = obj_name($self,$self,1);
-   } else {
-      err($self,$prog,"Permission denied.");
+   hasflag($self,"GOD") || hasflag($self,"WIZARD") ||
+      return err("Permission denied.");
+
+   cmd_wall($self,$prog,$_[0]) if($_[0] !~ /^\s*/);
+
+   audit($self,$prog,"\@shutdown");
+
+   for my $key (keys %connected) {
+      my $hash = @connected{$key};
+      necho(self   => $self,
+            prog   => $prog,
+            target => [ $hash, "%s has been shutdown by %s.",
+                        conf("mudname"),obj_name($self,$self,1) ]
+      );
+      cmd_boot($self,$prog,"#" . $$hash{obj_id});
    }
+   @info{run} = 0;                           # signal shutdown
+   @info{shutdown_by} = obj_name($self,$self,1);
 }
 
 sub cmd_slash
 {
    my ($self,$prog) = (obj(shift),shift);
-   my $txt = $$prog{user}->{last}->{cmd};
+   my $txt = @{$$prog{cmd}}{cmd};
 
    if($txt =~ /^\\\\/) {
       cmd_emit($self,$prog,$');
@@ -1490,15 +1381,15 @@ sub cmd_parent
 
    if($parent eq undef) {
       set($self,$prog,$target,"obj_parent",undef,1);
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "Unset." ]
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "Unset." ]
       );
    } else {
       set($self,$prog,$target,"obj_parent",$$parent{obj_id},1);
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "Set." ]
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "Set." ]
       );
    }
 }
@@ -1521,6 +1412,11 @@ sub cmd_capture
                        output => $$prog{output},
                        self => $self
                      };
+
+   necho(self   => $self,
+         prog   => $prog,
+         source => [ "Capture started (%s / %s)." , $attr,$command]
+   );
 
    mushrun(self   => $self,
            prog   => $prog,
@@ -1610,15 +1506,15 @@ sub cmd_search
       delete @$cmd{search_pos};
 
       if($#{$$cmd{out}} == -1) {
-         echo(self   => $self,
-              prog   => $prog,
-              source => [ "Nothing found." ]
-             );
+         necho(self   => $self,
+               prog   => $prog,
+               source => [ "Nothing found." ]
+           );
       } else {
-         echo(self   => $self,
-              prog   => $prog,
-              source => [ join(($$prog{nomushrun}) ? " " : "\n",@{$$cmd{out}})]
-             );
+         necho(self   => $self,
+               prog   => $prog,
+               source => [ join(($$prog{nomushrun}) ? " " : "\n",@{$$cmd{out}})]
+           );
       }
    } else {
       return "RUNNING";                                     # more to do
@@ -1669,10 +1565,10 @@ sub cmd_big
              last if $#out > 10;
          }
       }
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ join("\n",@out) ]
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ join("\n",@out) ]
+        );
       delete @$cmd{big_pos};
    } else {
       return "RUNNING";                                     # more to do
@@ -1711,14 +1607,14 @@ sub cmd_function
    verify_switches($self,$prog,$switch,"list") || return;
 
    if(defined $$switch{list} || $txt =~ /^\s*$/) {
-      echo(self   => $self,                                    # notify user
-           prog   => $prog,
-           source => [ list_user_functions() ]
-          );
+      necho(self   => $self,                                    # notify user
+            prog   => $prog,
+            source => [ list_user_functions() ]
+           );
       return;
    }
 
-   my ($name,$atr) = besplit($self,$prog,$txt,"=");
+   my ($name,$atr) = besplit($self,$prog,shift,"=");
 
    if($name =~ /^\s*([a-z])([a-z0-9_]*)\s*$/) {
       $name = "$1$2";
@@ -1736,10 +1632,10 @@ sub cmd_function
 
    @{@info{mush_function}}{$name} = trim($atr);
 
-   echo(self   => $self,                                    # notify user
-        prog   => $prog,
-        source => [ "Set." ]
-       );
+   necho(self   => $self,                                    # notify user
+         prog   => $prog,
+         source => [ "Set." ]
+        );
 }
 
 
@@ -1767,14 +1663,14 @@ sub cmd_quota
       }
    }
 
-   echo(self   => $self,                                    # notify user
-        prog   => $prog,
-        source => [ "%s Quota: %9s  Used: %9s",
-                    obj_name($target),
-                    quota($target,"max"),
-                    quota($target,"used"),
-                  ]
-       );
+   necho(self   => $self,                                    # notify user
+         prog   => $prog,
+         source => [ "%s Quota: %9s  Used: %9s",
+                     obj_name($target),
+                     quota($target,"max"),
+                     quota($target,"used"),
+                   ]
+        );
 }
 
 #
@@ -1807,10 +1703,10 @@ sub cmd_wipe
       }
    }
 
-   echo(self   => $self,                                    # notify user
-        prog   => $prog,
-        source => [ "Wiped - %d attribute%s.",$count,($count != 1) ? "s" : ""]
-       );
+   necho(self   => $self,                                    # notify user
+         prog   => $prog,
+         source => [ "Wiped - %d attribute%s.",$count,($count != 1) ? "s" : ""]
+        );
 }
 
 #
@@ -1891,11 +1787,11 @@ sub cmd_stats
       $hash = gather_stats(1,"all");
    } elsif($txt =~ /^\s*$/) {
       $hash = gather_stats(2);
-      return echo(self   => $self,
-                  prog   => $prog,
-                  source => [ "The universe contains %d objects.",
-                               $$hash{OBJECT} ]
-                 );
+      return necho(self   => $self,
+                   prog   => $prog,
+                   source => [ "The universe contains %d objects.",
+                                $$hash{OBJECT} ]
+                  );
    } else {
       $target = find_player($self,$prog,$txt) ||
          return err($self,$prog,"Unknown player.");
@@ -1903,18 +1799,18 @@ sub cmd_stats
       $hash = gather_stats(1,"",$target);
    }
 
-   echo(self   => $self,
-        prog   => $prog,
-        source => [ "%s objects = %s rooms, %s exits, %s things, %s " .
-                       "players. (%s garbage)",
-                    $$hash{ROOM} + $$hash{EXIT} + $$hash{OBJECT} +
-                        $$hash{PLAYER} +  $$hash{GARBAGE},
-                    $$hash{ROOM},
-                    $$hash{EXIT},
-                    $$hash{OBJECT},
-                    $$hash{PLAYER},
-                    $$hash{GARBAGE} ]
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         source => [ "%s objects = %s rooms, %s exits, %s things, %s " .
+                        "players. (%s garbage)",
+                     $$hash{ROOM} + $$hash{EXIT} + $$hash{OBJECT} +
+                         $$hash{PLAYER} +  $$hash{GARBAGE},
+                     $$hash{ROOM},
+                     $$hash{EXIT},
+                     $$hash{OBJECT},
+                     $$hash{PLAYER},
+                     $$hash{GARBAGE} ]
+        );
 }
 
 
@@ -1950,10 +1846,10 @@ sub cmd_mail
 
       set($self,$prog,$self,$$mail{attr},undef,1);
 
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "MAIL: Deleted." ]
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "MAIL: Deleted." ]
+           );
    } elsif($value ne undef) {                           # handle mail send
       $value = evaluate($self,$prog,$value) if(@{$$prog{cmd}}{source} == 0);
 
@@ -1966,33 +1862,33 @@ sub cmd_mail
       set($self,$prog,$target,"OBJ_MAIL_$seq",           # save email message
           time() .",". owner_id($self) . ",1," . trim($value),1);
 
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "MAIL: You have sent mail to %s.", name($target) ],
-           target => [ $target, "MAIL: You have a new message from %s.",
-                       name(owner($self))]
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "MAIL: You have sent mail to %s.", name($target) ],
+            target => [ $target, "MAIL: You have a new message from %s.",
+                        name(owner($self))]
+           );
    } elsif($txt =~ /^\s*short\s*$/) {
       my @list = get_mail_idx($self);
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "MAIL: You have %s messages.", $#list + 1 ]
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "MAIL: You have %s messages.", $#list + 1 ]
+           );
    } elsif($txt =~ /^\s*(\d+)\s*$/) {                       # display 1 email
       my $mail = get_mail($self,$1) ||
          return err($self,$prog,"Invalid email message.");
 
-      echo(self   => $self,                                  # show results
-           prog   => $prog,
-           source => [ "%s\nFrom:    %-37s At: %s\n%s\n%s\n%s\n",
-                       ("-" x 75),
-                       name($$mail{from}),
-                       scalar localtime($$mail{sent}),
-                       ("-" x 75),
-                       trim($$mail{msg}),
-                       ("-" x 75)
-                     ]
-          );
+      necho(self   => $self,                                  # show results
+            prog   => $prog,
+            source => [ "%s\nFrom:    %-37s At: %s\n%s\n%s\n%s\n",
+                        ("-" x 75),
+                        name($$mail{from}),
+                        scalar localtime($$mail{sent}),
+                        ("-" x 75),
+                        trim($$mail{msg}),
+                        ("-" x 75)
+                      ]
+           );
 
       set($self,$prog,$self,$$mail{attr},                      # set read flag
           "$$mail{sent},$$mail{from},0,$$mail{msg}",1);
@@ -2019,17 +1915,17 @@ sub cmd_mail
       }
       $out .= "           * No email *\n" if $out eq undef;
 
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ " # | New | Sent           | Sender          |" .
-                          " Message\n" .
-                       "---|-----|----------------|" . ("-"x17) ."|" .
-                           ("-" x30)."\n" .
-                       $out .
-                       "---|-----|----------------|" . ("-"x17) ."|" .
-                           ("-" x30) . "\n"
-                     ]
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ " # | New | Sent           | Sender          |" .
+                           " Message\n" .
+                        "---|-----|----------------|" . ("-"x17) ."|" .
+                            ("-" x30)."\n" .
+                        $out .
+                        "---|-----|----------------|" . ("-"x17) ."|" .
+                            ("-" x30) . "\n"
+                      ]
+           );
    }
 }
 
@@ -2066,18 +1962,14 @@ sub cmd_while
        con("      cmd: %s by %s\n",$$prog{invoking_command},
            obj_name($$prog{created_by}));
        return err($self,$prog,"while exceeded maxium loop of 5000, stopped");
-    } else {
-       my $test = test($self,$prog,$$cmd{while_test});
-#       con("TEST: '%s'\n",$test);
-       if($test) {
-          mushrun(self   => $self,
-                  prog   => $prog,
-                  source => 0,
-                  cmd    => $$cmd{while_cmd},
-                  child  => 1
-                 );
-          return "RUNNING";
-       }
+    } elsif(test($self,$prog,$$cmd{while_test})) {
+       mushrun(self   => $self,
+               prog   => $prog,
+               source => 0,
+               cmd    => $$cmd{while_cmd},
+               child  => 1
+              );
+       return "RUNNING";
     }
     return "DONE";
 }
@@ -2320,10 +2212,10 @@ sub cmd_bad
       }
    }
    if($#out > -1) {
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ join("\n",@out) ]
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ join("\n",@out) ]
+     );
    }
    if($$cmd{bad_pos} >= $#db) {                          # search is done
       delete @$cmd{bad_pos};
@@ -2339,10 +2231,10 @@ sub cmd_bad
             }
          }
       }
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ join("\n",@out) . "\n**End of List***" ]
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ join("\n",@out) . "\n**End of List***" ]
+        );
       delete @$cmd{bad_pos};
    } else {
       return "RUNNING";                                     # more to do
@@ -2388,19 +2280,19 @@ sub cmd_find
 
    if($$cmd{find_pos} >= $#db) {                       # search is done
       push(@out,"***End of List***");
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ join("\n",@out) ]
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ join("\n",@out) ]
+        );
       delete $$cmd{find_pos};                                 # clean up
       delete $$cmd{find_pat};
       delete $$cmd{find_owner};
    } else {
       if($#out > -1) {
-         echo(self   => $self,
-              prog   => $prog,
-              source => [ join("\n",@out) ]
-             );
+         necho(self   => $self,
+               prog   => $prog,
+               source => [ join("\n",@out) ]
+           );
       }
       return "RUNNING";                                     # more to do
    }
@@ -2413,16 +2305,16 @@ sub cmd_perl
 
    if(hasflag($self,"GOD")) {
       audit($self,$prog,"\@perl");
-#      eval ( $txt );
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "Done." ],
-          );
+      eval ( $txt );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "Done." ],
+           );
    } else {
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "Permission Denied." ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "Permission Denied." ],
+           );
    }
 }
 
@@ -2437,10 +2329,10 @@ sub cmd_websocket
    if(hasflag(owner($self),"WIZARD")) {
       websock_wall($txt);
    } else {
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "Permission Denied." ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "Permission Denied." ],
+           );
    }
 }
 
@@ -2453,15 +2345,15 @@ sub cmd_score
    my ($self,$prog,$txt) = (obj(shift),shift,shift);
 
    if($txt =~ /^\s*$/) {
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "You have %s.", money($self,1) ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "You have %s.", money($self,1) ],
+           );
    } else {
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "Score expects no arguments." ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "Score expects no arguments." ],
+           );
    }
 }
 
@@ -2511,13 +2403,13 @@ sub cmd_give
       }
 
       if($amount > $cost) {                             # paid too much
-          echo(self   => $self,
-               prog   => $prog,
-               source => [ "You get %s %s in change.",
-                           trim($amount) - $cost, ($amount - $cost == 1) ?
-                              conf("money_name_singular") :
-                              conf("money_name_plural") ]
-              );
+          necho(self   => $self,
+                prog   => $prog,
+                source => [ "You get %s %s in change.",
+                            trim($amount) - $cost, ($amount - $cost == 1) ?
+                               conf("money_name_singular") :
+                               conf("money_name_plural") ]
+               );
       } elsif($amount < $cost) {                           # not enough
          return err($self,$prog,"Feeling poor today?");
       }
@@ -2534,19 +2426,20 @@ sub cmd_give
    give_money($self,"-$amount");
    give_money($target,"$amount");
 
-   echo(self   => $self,
-        prog   => $prog,
-        source => [ "You give %s %s to %s.",
-                    trim($amount),
-                    ($amount== 1) ? conf("money_name_singular") :
-                                    conf("money_name_plural"),
-                    name($target) ],
-        target => [ $target, "%s gives you %s %s.",
-                    name($self),
-                    trim($amount),
-                    ($amount == 1) ? conf("money_name_singular") :
-                                     conf("money_name_plural") ]
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         source => [ "You give %s %s to %s.",
+                     trim($amount),
+                     ($amount== 1) ? conf("money_name_singular") :
+                                     conf("money_name_plural"),
+                     name($target) ],
+         target => [ $target, "%s gives you %s %s.",
+                     name($self),
+                     trim($amount),
+                     ($amount == 1) ? conf("money_name_singular") :
+                                      conf("money_name_plural") ]
+        );
+
 }
 
 
@@ -2570,7 +2463,7 @@ sub mini_trigger
 
    # get output to send
    if(defined $$prog{output} && $#{$$prog{output}} >= 0) {
-      $data = join("",@{$$prog{output}});
+      $data = join("\n",@{$$prog{output}});
    } else {
       $data = "No data returned";
    }
@@ -2632,12 +2525,6 @@ sub cmd_trigger
    my $attr = pget($target,$name,1) ||
       return err($self,$prog,"No such attribute.");
 
-   my $hash = {
-      atr_name => $name,
-      atr_value => $attr,
-      atr_owner => $$target{obj_id},
-      atr_regexp => "(.*)"
-   };
 
 #   printf("ATTR: '%s'\n",$$attr{value});
 
@@ -2661,10 +2548,11 @@ sub cmd_trigger
 #      }
 #   }
 #   push(@wild,$last) if($last ne undef);
-    for my $i (balanced_split($params,',')) {
+    for my $i (balanced_split($params,',',2)) {
        if($$switch{noeval}) {
          push(@wild,$i);
        } else {
+	       #         printf("trig_Add: '%s' -> '%s'\n",$i,evaluate($self,$prog,$i));
          push(@wild,evaluate($self,$prog,$i));
        }
     }
@@ -2673,12 +2561,12 @@ sub cmd_trigger
        push(@wild,shift(@wild));
     }
 
-#   printf("SELF:  '$$self{obj_id}'\n");
-#   printf("CMD:   '%s'\n",$$attr{value});
-#   printf("RUNAS: '%s'\n",$$target{obj_id});
-#   printf("WILD:  '%s'\n",join(',',@wild));
-#   printf("PROG:  '%s'\n",$$prog{pid});
-#   printf("%s\n",print_var($prog));
+   # printf("SELF:  '$$self{obj_id}'\n");
+   # printf("CMD:   '%s'\n",$$attr{value});
+   # printf("RUNAS: '%s'\n",$$target{obj_id});
+   # printf("WILD:  '%s'\n",join(',',@wild));
+   # printf("PROG:  '%s'\n",$$prog{pid});
+   # printf("%s\n",print_var($prog));
 
    mushrun(self   => $self,
            prog   => $prog,
@@ -2687,8 +2575,6 @@ sub cmd_trigger
            cmd    => $$attr{value},
            child  => 2,
            wild   => [ @wild ],
-           from   => "ATTR",
-           attr   => $hash,
            invoker=> (defined $$prog{created_by}) ? $$prog{created_by} : $self,
           );
 }
@@ -2711,14 +2597,14 @@ sub cmd_huh
    }
 #   printf("%s\n",code("long"));
    if(hasflag($self,"VERBOSE")) {
-      echo(self   => owner($self),
-           prog   => $prog,
-           target => [ owner($self),
-                       "%s] %s",
-                       name($self),
-                       trim((($txt eq undef) ? "" : " " . $txt))
-                     ]
-          );
+      necho(self   => owner($self),
+            prog   => $prog,
+            target => [ owner($self),
+                        "%s] %s",
+                        name($self),
+                        trim((($txt eq undef) ? "" : " " . $txt))
+                      ]
+           );
    }
 
    # record missing command for @missing
@@ -2727,11 +2613,11 @@ sub cmd_huh
    }
 
    if(lord(@{$$prog{cmd}}{cmd}) ne 0) {
-#      printf("HuH: '%s' -> '%s'\n",$$self{obj_id},@{$$prog{cmd}}{cmd});
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "Huh? (Type \"HELP\" for help.)" ]
-          );
+      # printf("HuH: '%s' -> '%s'\n",$$self{obj_id},@{$$prog{cmd}}{cmd});
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "Huh? (Type \"HELP\" for help.)" ]
+           );
    }
 }
 
@@ -2743,9 +2629,9 @@ sub cmd_offline_huh
    my $prog = prog($obj,$obj,$obj);
    $$prog{read_only} = 1;
    if(@{@connected{$sock}}{type} eq "WEBSOCKET") {
-      ws_echo($sock,add_return(mush_eval($obj,$prog,conf("login"))));
+      ws_echo($sock,evaluate($obj,$prog,conf("login")));
    } else {
-      printf($sock "%s",add_return(mush_eval($obj,$prog,conf("login"))));
+      printf($sock "%s\r\n",evaluate($obj,$prog,conf("login")));
    }
 }
 
@@ -2759,13 +2645,13 @@ sub cmd_version
 
    $src = "<a href=$src>$src</a>" if($$prog{hint} eq "WEB");
 
-   echo(self   => $self,
-        prog   => $prog,
-        source => [ "TeenyMUSH :  Version %s [cmhudson\@gmail.com]\n".
-                    "   Source :  %s",
-                    $ver,$src
-                  ]
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         source => [ "TeenyMUSH :  Version %s [cmdhudson\@gmail.com]\n".
+                     "   Source :  %s",
+                     $ver,$src
+                   ]
+        );
 }
 
 sub cmd_crash
@@ -2775,22 +2661,16 @@ sub cmd_crash
    hasflag($self,"GUEST") &&
       return err($self,$prog,"Permission denied.");
 
-   echo(self   => $self,
-        prog   => $prog,
-        source => [ "You \@crash the server, yee haw.\n%s",code("long") ],
-        room   => [ $self, "%s \@crashes the server.", name($self) ],
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         source => [ "You \@crash the server, yee haw.\n%s",code("long") ],
+         room   => [ $self, "%s \@crashes the server.", name($self) ],
+        );
    my $foo;
    @{$$foo{crash}};
 }
 
 
-#
-# cmd_reset
-#    Delete all sockets. This needs to be rewriten to actually close the
-#    sockets instead of assuming the sockets are already closed or will close
-#    by perl's garbage collectors.
-#
 sub cmd_reset
 {
    my ($self,$prog) = (obj(shift),shift);
@@ -2799,49 +2679,50 @@ sub cmd_reset
      return err($self,$prog,"Permission Denied.");
    } else {
      delete @info{io};
-     echo(self   => $self,
-          prog   => $prog,
-          source => [ "All telnet connections reset." ]
-         );
+     necho(self   => $self,
+           prog   => $prog,
+           source => [ "All telnet connections reset." ]
+          );
   }
 }
 
 #      my $eval = lock_eval($self,$prog,$self,$txt);
 sub cmd_lock
 {
-   my ($self,$prog,$txt,$switch) = (obj(shift),shift,shift,shift);
-
-   verify_switches($self,$prog,$switch,"interact") || return;
+   my ($self,$prog,$txt) = (obj(shift),shift,shift);
 
    hasflag($self,"GUEST") &&
       return err($self,$prog,"Permission denied.");
 
-   my ($obj,$value) = balanced_split($txt,"=",4);
+   if($txt =~ /^\s*([^ ]+)\s*=\s*/) {
 
+      my $target = find($self,$prog,$1);       # find target
 
-   my $target = find($self,$prog,$obj);       # find target
+      if($target eq undef) {                            # found invalid object
+         return err($self,$prog,"I don't see that here.");
+      } elsif(!controls($self,$target)) {                 # can modify object?
+         return err($self,$prog,"Permission denied.");
+      } else {                                              # set the lock
+         my $lock = lock_compile($self,$prog,$self,$');
 
-   if($target eq undef) {                            # found invalid object
-      return err($self,$prog,"I don't see that here.");
-   } elsif(!controls($self,$target)) {                 # can modify object?
-      return err($self,$prog,"Permission denied.");
-   } else {                                              # set the lock
-      my $lock = lock_compile($self,$prog,$self,$value);
-
-      if($$lock{error}) {                               # did lock compile?
-         echo(self    => $self,
-              prog    => $prog,
-              source => [ "I don't understand that key, $$lock{errormsg}" ]
-             );
-      } elsif(defined $$switch{interact}) {
-         set($self,$prog,$target,"OBJ_LOCK_INTERACT",$$lock{lock},1);
-      } else {
-         set($self,$prog,$target,"OBJ_LOCK_DEFAULT",$$lock{lock},1);
-         echo(self => $self,
-              prog => $prog,
-              source => [ "Set." ]
-             );
+         if($$lock{error}) {                               # did lock compile?
+            necho(self    => $self,
+                  prog    => $prog,
+                  source => [ "I don't understand that key, $$lock{errormsg}" ]
+                 );
+         } else {
+            set($self,$prog,$target,"OBJ_LOCK_DEFAULT",$$lock{lock},1);
+            necho(self => $self,
+                  prog => $prog,
+                  source => [ "Set." ]
+                 );
+         }
       }
+   } else {
+       necho(self   => $self,
+             prog   => $prog,
+             source => [ "usage: \@lock <object> = <key>" ],
+            );
    }
 }
 
@@ -2902,10 +2783,10 @@ sub cmd_var
    $$prog{var} = {} if !defined $$prog{var};
 
    if($var =~ /^\s*\d+/) {
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "Variables may not start with numbers\n" ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "Variables may not start with numbers\n" ],
+           );
    } elsif($rest =~ /^\s*\+\+\s*$/) {                           # increment
       $value = @{$$prog{var}}{$var} + 1;
    } elsif($rest =~ /^\s*\-\-\s*$/) {                            # decrement
@@ -2942,13 +2823,11 @@ sub cmd_var
       return err($self,$prog,"Invalid command.");
    }
 
-   # con("SET: '$var' = '$value'");
-
    if(!managed_var_set($prog,$var,$value)) {
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ managed_var_set_error() ]
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ managed_var_set_error() ]
+           );
    }
 }
 
@@ -2971,10 +2850,10 @@ sub cmd_boot
       }
    } else {
       $target = find_player($self,$prog,$txt) ||
-         return echo(self   => $self,
-                     prog   => $prog,
-                     source => [ "I don't see that here." ]
-                    );
+         return necho(self   => $self,
+                      prog   => $prog,
+                      source => [ "I don't see that here." ]
+                     );
    }
 
    for my $key (keys %connected) {
@@ -2988,20 +2867,20 @@ sub cmd_boot
          (!defined $$switch{port} && name($hash) eq name($target))) {
 
          if(defined $$switch{port}) {
-            echo(self   => $self,
-                 target => [ $hash, "%s has \@booted you.", name($self)],
-                 prog   => $prog,
-                 source => [ "You \@booted port %s off!", $$hash{port} ],
-                );
+            necho(self   => $self,
+                  target => $hash,
+                  prog   => $prog,
+                  source => [ "You \@booted port %s off!", $$hash{port} ],
+                 );
             audit($self,$prog,"Port $$hash{port} \@booted");
          } else {
-            echo(self   => $self,
-                 target => $hash,
-                 prog   => $prog,
-                 target => [ $hash, "%s has \@booted you.", name($self)],
-                 source => [ "You \@booted %s off!", obj_name($self,$hash)],
-                 room   => [ $hash, "%s has been \@booted.",name($hash) ],
-                );
+            necho(self   => $self,
+                  target => $hash,
+                  prog   => $prog,
+                  target => [ $hash, "%s has \@booted you.", name($self)],
+                  source => [ "You \@booted %s off!", obj_name($self,$hash)],
+                  room   => [ $hash, "%s has been \@booted.",name($hash) ],
+                 );
             audit($self,$prog,"%s \@booted",obj_name($target,$target));
          }
 
@@ -3014,16 +2893,16 @@ sub cmd_boot
 
    if($boot == 0) {
       if($$switch{port} && $boot == 0) {
-         echo(self   => $self,
-              prog   => $prog,
-              source => [ "Unknown port specified." ],
-             );
+         necho(self   => $self,
+               prog   => $prog,
+               source => [ "Unknown port specified." ],
+              );
       } else {
-         echo(self   => $self,
-              prog   => $prog,
-              source => [ "Unknown connected person specified." ],
-             );
-      }
+          necho(self   => $self,
+                prog   => $prog,
+                source => [ "Unknown connected person specified." ],
+               );
+       }
    }
 }
 
@@ -3035,33 +2914,33 @@ sub cmd_killpid
       return err($self,$prog,"Permission Denied.");
    } elsif($txt =~ /^\s*(\d+)\s*$/) {
       if(!defined @engine{$1}) {
-         echo(self   => $self,                           # target's room
-              prog   => $prog,
-              source => [ "PID '%s' does not exist.", $1 ],
-             );
+         necho(self   => $self,                           # target's room
+               prog   => $prog,
+               source => [ "PID '%s' does not exist.", $1 ],
+              );
       } elsif(hasflag(@engine{$1}->{created_by},"GOD") &&
               !hasflag($self,"GOD")) {
-         echo(self   => $self,                           # target's room
-              prog   => $prog,
-              source => [ "Permission denied, pid $1 owned by a GOD." ],
-             );
+         necho(self   => $self,                           # target's room
+               prog   => $prog,
+               source => [ "Permission denied, pid $1 owned by a GOD." ],
+              );
       } elsif(!controls($self,@engine{$1}->{created_by})) {
-         echo(self   => $self,                           # target's room
-              prog   => $prog,
-              source => [ "Permission denied, you do not control pid $1." ],
-             );
+         necho(self   => $self,                           # target's room
+               prog   => $prog,
+               source => [ "Permission denied, you do not control pid $1." ],
+              );
       } else {
          delete @engine{$1};
-         echo(self   => $self,
-              prog   => $prog,
-              source => [ "PID '%s' has been killed", $1 ],
-             );
+         necho(self   => $self,
+               prog   => $prog,
+               source => [ "PID '%s' has been killed", $1 ],
+              );
       }
    } else {
-      echo(self   => $self,                           # target's room
-           prog   => $prog,
-           source => [ "Usage: \@kill <pid>", $1 ],
-          );
+      necho(self   => $self,                           # target's room
+            prog   => $prog,
+            source => [ "Usage: \@kill <pid>", $1 ],
+           );
    }
 }
 
@@ -3162,78 +3041,10 @@ sub cmd_ps
          }
       }
    }
-   echo(self   => $self,                           # target's room
-        prog   => $prog,
-        source => [ "%s", join("\n",@out) ]
-       );
-}
-
-#
-# serial_delete
-#    Remove the lock on programs running for a particular object/attr combo
-#
-sub serial_delete
-{
-   my $prog = shift;
-
-   if(defined $$prog{attr}) {
-      my $serial = @info{serial};
-      my $id = $$prog{attr}->{atr_owner} ."-". $$prog{attr}->{atr_name};
-
-      if(defined $$serial{$id} && $$serial{$id} == $$prog{$id}) {
-         delete $$serial{$id};
-      }
-   }
-}
-
-#
-# serial_canrun
-#    TeenyMUSH only lets one $command run at a time, it does so by
-#    placing a lock in @info{serial} for a particular object /
-#    attribute pair. If the lock exists, don't run. If the lock doesn't
-#    exist then let it run. The lock will also be set if its okay to run.
-#
-sub serial_canrun
-{
-   my $prog = shift;
-
-   if(defined $$prog{attr}) {
-      @info{serial} = {} if(!defined @info{serial});
-      my $serial = @info{serial};
-      my $id = $$prog{attr}->{atr_owner} ."-". $$prog{attr}->{atr_name};
-
-      if(defined $$serial{$id} && $$serial{$id} == $$prog{pid}) {
-         return 1;                           # our $prog's lock, okay to run
-      } elsif(!defined @engine{$$serial{$id}} ||
-              !defined $$serial{$id}) {
-         delete @$serial{$id};             # no lock or locking $prog !exists
-         $$serial{$id} = $$prog{pid};
-         return 1;
-      } else {
-         return 0;                                # not our lock, do not run
-      }
-   } else {
-      return 1;                  # $$prog{attr} not set yet , can't use locks
-   }
-}
-
-#
-# serial_delete
-#    See serial_canrun. Removes the lock set by this function when the
-#    program finishes.
-#
-sub serial_delete
-{
-   my $prog = shift;
-
-   if(defined $$prog{attr}) {
-      my $serial = @info{serial};
-      my $id = $$prog{attr}->{atr_owner} ."-". $$prog{attr}->{atr_name};
-
-      if(defined $$serial{$id} && $$serial{$id} == $$prog{$id}) {
-         delete $$serial{$id};
-      }
-   }
+   necho(self   => $self,                           # target's room
+         prog   => $prog,
+         source => [ "%s", join("\n",@out) ]
+        );
 }
 
 #
@@ -3270,25 +3081,24 @@ sub cmd_halt
          ($$obj{obj_id} == @{$$program{created_by}}{obj_id} || $iswiz) &&
          ($lookfor eq undef || $lpid eq $pid || 
           $ldbref eq $cmd->{runas}->{obj_id})) {
-         echo(self => $self,
-              prog => $prog,
-              source => [ "Pid %s stopped : %s%s" ,
-                          $pid,
-                          substr(single_line($$cmd{cmd}),0,40),
-                          (length(single_line($$cmd{cmd})) > 40) ? "..." : ""
-                        ]
-             );
+         necho(self => $self,
+               prog => $prog,
+               source => [ "Pid %s stopped : %s%s" ,
+                           $pid,
+                           substr(single_line($$cmd{cmd}),0,40),
+                           (length(single_line($$cmd{cmd})) > 40) ? "..." : ""
+                         ]
+              );
 
          close_telnet($program);
-         serial_delete(@engine{$pid});
          delete @engine{$pid};
          $count++;
       }
    }
-   echo(self => $self,
-           prog => $prog,
-           source => [ "%s queue entries removed." , $count]
-       );
+   necho(self => $self,
+            prog => $prog,
+            source => [ "%s queue entries removed." , $count]
+        );
 }
 
 
@@ -3328,55 +3138,16 @@ sub test
 
 #
 # find_free_dbrefs
-#    Populate @free with recycled database objects without pausing the
-#    mush.
 #
-sub cmd_free
+#    @destroy will keep track of used dbrefs but this function will
+#    populate the list on startup / reload of code.
+#
+sub find_free_dbrefs
 {
-   my ($self,$prog,$txt,$switch) = (obj(shift),shift,shift,shift);
-   my $start;
+   delete @free[0 .. $#free];
 
-   my $cmd = $$prog{cmd};
-   if(!defined $$cmd{free_pos}) {
-      delete @free[0 .. $#free];
-      $$cmd{free_pos} = 1;
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "\@free dbref sweep started." ],
-          ) if $self ne undef;
-   }
-
-   for($start=$$cmd{free_pos};                   # loop for 100 objects
-          $$cmd{free_pos} < $#db &&
-          $$cmd{free_pos} - $start < 100;
-          $$cmd{free_pos}++) {
-      push(@free,$$cmd{free_pos}) if(!valid_dbref($$cmd{free_pos}));
-   }
-
-   if($$cmd{bad_pos} >= $#db) {                          # search is done
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "\@free dbree sweep completed." ],
-          ) if $self ne undef;
-      delete @$cmd{bad_pos};
-   } else {
-      return "RUNNING";
-   }
-}
-
-#
-# find_free_dbref
-#    Search the entire db for free dbrefs. Use @free if you don't want
-#    to pause the mush.
-#
-sub find_free_dbref
-{
-   my $self;
-   my $prog = {};
-   $$prog{cmd} = {};
- 
-   while(cmd_free($self,$prog) eq "RUNNING") {
-      # cmd_free does all the work.
+   for my $i (0 .. $#db) {
+      push(@free,$i) if(!valid_dbref($i));
    }
 }
 
@@ -3405,15 +3176,9 @@ sub cmd_dump
    my ($file,$start);
 
 
-   if($type =~ /^\d+$/) {
-      change($type);
-   }
-
    @info{"conf.mudname"} = "TeenyMUSH" if(conf("mudname") eq undef);
 
-   if(@info{standby}) {
-      return;                                   # no dumps in standby mode
-   } elsif(in_run_function($prog)) {
+   if(in_run_function($prog)) {
       return out($prog,"#-1 \@DUMP can not be called from RUN function");
    } elsif(!hasflag($self,"WIZARD") && !hasflag($self,"GOD")) {
       return err($self,$prog,"Permission denied.");
@@ -3428,17 +3193,6 @@ sub cmd_dump
    #-----------------------------------------------------------------------#
    my $cmd = $$prog{cmd};
    if(!defined $$cmd{dump_pos}) {                      # initialize "loop"
-
-
-      # run a dirty dump before doing a full backup. This will create
-      # the required archive_logs. The change# for both should be the
-      # same so the number needs to be reverted back. An archive_log
-      # should always be created even as a place holder.
-      $$cmd{dump_change} = change() if !defined $$cmd{dump_change};
-      my $result = cmd_dirty_dump($self,$prog,"ALWAYS_DUMP",{});
-      return "RUNNING" if($result eq "RUNNING");
-      change($$cmd{dump_change});
-
       @info{dirty} = {};                               # clear dirty bits
       if(defined @info{backup_mode} && is_running(@info{backup_mode})) {
          return err($self,$prog,"Backup is already running.");
@@ -3467,26 +3221,19 @@ sub cmd_dump
          $mon++;
          $yr -= 100;
 #
-         my $fn = sprintf("%s/%s.%010d.%02d%02d%02d",
-                          @info{dumps},
-                          conf("mudname"),
-                          change(),
-                          $yr,$mon,$day
-                         );
+         my $fn = sprintf("@info{dumps}/%s.%02d%02d%02d_%02d%02d%02d",
+                          conf("mudname"),$yr,$mon,$day,$hour,$min,$sec);
 
          open($file,"> $fn.tdb") ||
            return err($self,$prog,"Unable to open $fn for writing");
          @info{dump_name} = $fn;
 
-         printf($file "server: %s, version=%s, change#=%s, exported=%s, " .
-                   "type=%s\n", 
-                conf("version"),
-                db_version(),
-                change(),
-                scalar localtime(),
-                $type
-               );
+         printf($file "server: %s, version=%s, change#=0, exported=%s, " .
+            "type=%s\n", conf("version"),db_version(),scalar localtime(),
+            $type);
       }
+
+      @info{change} = 0;
 
       $$cmd{dump_file} = $file;
       @info{backup_mode} = $$prog{pid};
@@ -3540,13 +3287,12 @@ sub cmd_dump
                    "CONNECTED,PLAYER,LOG",
                    "<LOG> Database finished."
                   );
-         echo(self   => $self,
-              prog   => $prog,
-              source => [ "\@dump completed." ],
-             ) if !@info{shell};
+         necho(self   => $self,
+               prog   => $prog,
+               source => [ "\@dump completed." ],
+              ) if !@info{shell};
       }
       con("**** Dump Complete: Exiting ******\n") if($type eq "CRASH");
-      change("+");
 
       $$prog{command} = 1;                 # delete cost of running command
                                            # so it doesn't show in console
@@ -3575,60 +3321,28 @@ sub do_full_dirty_dump
    }
 }
 
-sub change
-{
-   my $action = shift;
-
-   if($action eq "+") {
-      @info{change}++;
-   } elsif(defined $action) {
-      @info{change} = $action;
-   } else {
-      return @info{change};
-   }
-}
-
-sub dbwrite
-{
-   my ($file,$fmt,@args) = @_;
-   my $archive;
-
-   if(conf_true("archive_logging")) {
-      $archive = @info{afd};
-      printf($archive $fmt,@args);
-   }
-   printf($file $fmt,@args);
-}
-
 sub cmd_dirty_dump
 {
    my ($self,$prog,$txt,$switch) = @_;
-
    $self = $$self{obj_id} if ref($self) eq "HASH";
    my ($file,$out);
    my $count = 0;
-   my $archive;
-
-   return if @info{standby};
 
    my $dirty = @info{dirty};
+   if(ref($dirty) ne "HASH" || 
+      (ref($dirty) eq "HASH" && scalar keys %$dirty == 0)) {
+      return;                                               # nothing to dump
+   }
 
    if(defined @info{backup_mode} && is_running(@info{backup_mode})) {
       return err($self,$prog,"Backup is already running.");
    }
 
-   $$prog{cmd} = {} if not defined $$prog{cmd};
    my $cmd = $$prog{cmd};
-   @info{dirty} = {} if !defined @info{dirty};
    if(!defined $$cmd{dirty_list}) {                       # initialize "loop"
+      @info{change} = 0 if !defined @info{change};
       $$cmd{dirty_list} = [ %{@info{dirty}} ];
       @info{dump_name} = $' if(@info{dump_name} =~ /^dumps\//i);
-
-      if((ref($dirty) ne "HASH" || 
-         (ref($dirty) eq "HASH" && scalar keys %$dirty == 0)) &&
-         $txt ne "ALWAYS_DUMP") {
-         return;                                               # nothing to dump
-      }
 
       if(@info{shell}) {
          open($file,">> $0") ||
@@ -3638,24 +3352,12 @@ sub cmd_dirty_dump
             return err($self,$prog,"Unable to open @info{dumps}/" .
                "@info{dump_name}.tdb for writing");
       }
-      if(conf_true("archive_logging")) {
-         open($archive,sprintf("> %s/archive_log/%s.%010d.al",
-                               @info{dumps},
-                               conf("mudname"),
-                               change()
-                              )
-             ) ||
-            con("Unable to open @info{dumps}/archive_log/%s.%010d.al for " .
-                "archive_log.\n",conf("mudname"),change());
-         @info{afd} = $archive;
-      }
       $$cmd{dirty_file} = $file;
-
-      dbwrite($file,"server: %s, version=%s, change#=%s, exported=%s, " .
-          "type=archive_log\n",conf("version"),db_version(),change(),
+      printf($file "server: %s, version=%s, change#=%s, exported=%s, " .
+          "type=archive_log\n",conf("version"),db_version(),@info{change}++,
           scalar localtime());
-      change("+");
    }
+   my $dirty = @info{dirty};
    my $list = $$cmd{dirty_list};
 
    while($#$list >= 0 && $count++ < 51) {             # do 50 objects a cycle
@@ -3667,12 +3369,12 @@ sub cmd_dirty_dump
          $out .= "$dbref,delobj";
       } else {
          # mark as previously deleted.
-         dbwrite($file,"%s,delobj\n",$dbref) if(defined $$dobj{destroyed});
+         printf($file "%s,delobj\n",$dbref) if(defined $$dobj{destroyed});
 
          # cycle all attributes that are dirty
          for my $key (sort keys %$dobj) {
             if($key =~ /^A_/ && !defined $$obj{$'}) {
-               dbwrite($file,"%s,delatr,%s\n",$dbref,$');
+               printf($file "%s,delatr,%s\n",$dbref,$');
             } elsif($key =~ /^A_/) {
                my $attr = $$obj{$'};
                my $name = $';
@@ -3681,15 +3383,15 @@ sub cmd_dirty_dump
 
                if(reserved($name) && defined $$attr{value} &&
                   $$attr{type} eq "list") {
-                  dbwrite($file,"%s,setatr,%s:%s:%s::L:%s\n",
+                  printf($file "%s,setatr,%s:%s:%s::L:%s\n",
                          $dbref,$name,$$attr{created},$$attr{modified},
                          join(',',keys %{$$attr{value}}));
                } elsif(defined $$attr{value} && $$attr{type} eq "hash") {
-                  dbwrite($file,"%s,setatr,%s:%s:%s::H:%s\n",
+                  printf($file "%s,setatr,%s:%s:%s::H:%s\n",
                          $dbref,$name,$$attr{created},$$attr{modified},
                          hash_serialize($$attr{value},$name,$dbref));
                } else {
-                  dbwrite($file,"%s,setatr,%s\n",$dbref,
+                  printf($file "%s,setatr,%s\n",$dbref,
                      serialize($name,$attr));
                }
             }
@@ -3699,12 +3401,10 @@ sub cmd_dirty_dump
    }
 
    if($#$list== -1) {
-      dbwrite($file,"** Dump Completed %s **\n", scalar localtime());
+      printf($file "** Dump Completed %s **\n", scalar localtime());
       close($file);
-      close($archive) if $archive ne undef;
       delete $$cmd{dirty_list};
       delete $$cmd{dirty_file};
-      delete @info{afd};
    } else {
       return "RUNNING";
    }
@@ -3773,10 +3473,10 @@ sub cmd_notify
    }
 
    if(!defined $$switch{quiet}) {
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "Notified." ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "Notified." ],
+           );
    }
 }
 
@@ -3804,10 +3504,10 @@ sub cmd_drain
    }
 
    if(!defined $$switch{quiet}) {
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "Notified." ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "Notified." ],
+           );
    }
 }
 
@@ -3847,10 +3547,8 @@ sub cmd_dolist
        
        $$cmd{dolist_cmd}   = $second;
        my $txt = evaluate($self,$prog,$first);
-       $txt =~ s/\r//g;
 #       printf("TXT:    '%s'\n",$txt);
        $$cmd{dolist_list} = [safe_split($txt,$delim)];
-#       printf("START: '%s'\n",join(',',@{$$cmd{dolist_list}}));
        $$cmd{dolist_count} = 0;
        $$prog{iter_stack} = [] if(!defined $$prog{iter_stack});
        $$cmd{dolist_loc} = $#{$$prog{iter_stack}} + 1;
@@ -3878,6 +3576,7 @@ sub cmd_dolist
    }
 
    my $item = trim(shift(@{$$cmd{dolist_list}}));
+#   printf("ITEM: '%s'\n",$item);
    if($item !~ /^\s*$/) {
 #      $item = fun_escape($self,$prog,$item);
       my $cmds = $$cmd{dolist_cmd};
@@ -3885,9 +3584,9 @@ sub cmd_dolist
 
       @{$$prog{iter_stack}}[$$cmd{dolist_loc}]={val => $item, pos=>++$count};
 
-      delete @$prog{attr} if defined $$prog{attr};
+      delete $$prog{attr} if defined $$prog{attr};
 
-      if(defined $$prog{cmd} && @{$$prog{cmd}}{source} == 1000) {
+      if(defined $$prog{cmd} && @{$$prog{cmd}}{source} == 1) {
          my $new = prog($self,$self,$self);
          $$new{iter_stack} = [];
          @{$$new{iter_stack}}[0]={val => $item, pos=> 0 };
@@ -3900,9 +3599,6 @@ sub cmd_dolist
                  invoker=> $self,
                 );
       } else {
-#         my $new = prog($self,$self,$self);
-         $$prog{iter_stack} = [] if !defined $$prog{iter_stack};
-         @{$$prog{iter_stack}}[0]={val => $item, pos=> 0 };
          mushrun(self   => $self,
                  prog   => $prog,
                  runas  => $self,
@@ -3926,7 +3622,6 @@ sub good_password
 {
    my $txt = shift;
 
-   return undef;
    if($txt !~ /^\s*.{8,999}\s*$/) {
       return "#-1 Passwords must be 8 characters or more";
    } elsif($txt !~ /[0-9]/) {
@@ -3947,38 +3642,38 @@ sub cmd_password
    if(hasflag($self,"GUEST")) {
       return err($self,$prog,"Permission Denied.");
    } elsif(!hasflag($self,"PLAYER")) {
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "Non-players do not need passwords." ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "Non-players do not need passwords." ],
+           );
    } elsif($txt =~ /^\s*([^ ]+)\s*=\s*([^ ]+)\s*$/) {
 
       my $result = good_password($2);
 
       if($result ne undef) {
-         return echo(self   => $self,
-                     prog   => $prog,
-                     source => [ "%s", $result ],
-                    );
+         return necho(self   => $self,
+                      prog   => $prog,
+                      source => [ "%s", $result ],
+                     );
       }
 
       if(mushhash($1) ne get($self,"obj_password")) {
-         echo(self   => $self,
-              prog   => $prog,
-              source => [ "Invalid old password." ],
-             );
+         necho(self   => $self,
+               prog   => $prog,
+               source => [ "Invalid old password." ],
+              );
       } else {
          db_set($self,"obj_password",mushhash($2));
-         echo(self   => $self,
-              prog   => $prog,
-              source => [ "Password changed." ],
-             );
+         necho(self   => $self,
+               prog   => $prog,
+               source => [ "Password changed." ],
+              );
       }
    } else {
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "usage: \@password <old_password> = <new_password>" ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "usage: \@password <old_password> = <new_password>" ],
+           );
    }
 }
 
@@ -4051,10 +3746,10 @@ sub cmd_sleep
    if(defined $$cmd{sleep}) {   # spin() will not run this command again
       delete @$cmd{sleep};      # until the sleep is done.
    } elsif(!isint($txt) || $txt > 5400) {
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "\@sleep is limited to 5400 seconds." ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "\@sleep is limited to 5400 seconds." ],
+           );
    } elsif($txt > 0) {
       $$cmd{sleep} = time() + $txt;                # signal spin() to wait.
       return "RUNNING";
@@ -4069,16 +3764,16 @@ sub cmd_read
    my $count = 0;
 
    if(!hasflag($self,"WIZARD") && !$flag) {
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "Permission denied." ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "Permission denied." ],
+           );
    } elsif($txt =~ /^\s*help\s*$/) {                     # import help data
-      if(!open($file,"files/help.txt")) {
-         return echo(self   => $self,
-                     prog   => $prog,
-                     source => [ "Could not open help.txt for reading." ],
-                    );
+      if(!open($file,"txt/help.txt")) {
+         return necho(self   => $self,
+                      prog   => $prog,
+                      source => [ "Could not open help.txt for reading." ],
+                     );
       }
 
       delete @help{keys %help};
@@ -4104,18 +3799,18 @@ sub cmd_read
          $count++;
       }
 
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "%s help items read containing %d lines of text.",
-                       $count, $. ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "%s help items read containing %d lines of text.",
+                        $count, $. ],
+           );
       close($file);
 
    } else {
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "Unknown read item '%s' specified.", trim($txt) ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "Unknown read item '%s' specified.", trim($txt) ],
+           );
    }
 }
 
@@ -4154,27 +3849,21 @@ sub cmd_squish
    $out =~ s/\r|\n//g;
    set($self,$prog,$target,$atr,$out);
 
-   echo(self   => $self,
-        prog   => $prog,
-        source => [ "%s",$out ],
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         source => [ "%s",$out ],
+        );
 }
 
 sub invoker
 {
-   my ($prog,$self,$flag) = (shift,obj(shift),shift);
-   my $id;
+   my ($prog,$self,$flag) = @_;
 
    if(ref($prog) eq "HASH" &&
       defined $$prog{cmd} &&
       defined @{$$prog{cmd}}{invoker}) {
-
-      if(ref($$prog{cmd}->{invoker}) eq "HASH") {
-         $id = $$prog{cmd}->{invoker}->{obj_id};
-      } else {
-         $id = $$prog{cmd}->{invoker};
-      }
-      return ($flag) ? $id : obj($id);
+      return ($flag) ? @{@{$$prog{cmd}}{invoker}}{obj_id} :
+         @{$$prog{cmd}}{invoker};
    } elsif($self eq undef && $flag) {
       return undef;
    } else {
@@ -4214,9 +3903,10 @@ sub cmd_switch
     my ($first,$second) = bsplit(shift(@list),"=");
     $first = ansi_trim(evaluate($self,$prog,$first));
     $first =~ s/[\r\n]//g;
-    $second =~ s/[\r\n]//g;
     $first =~ tr/\x80-\xFF//d;
-    unshift(@list,single_line($second));
+    unshift(@list,$second);
+    printf("FIRST: '%s'\n",$first);
+    printf("SECOND: '%s'\n",$second);
 
     while($#list >= 0) {
        # ignore default place holder used for readability
@@ -4244,11 +3934,10 @@ sub cmd_switch
                                child  => 1,
                                invoker=> invoker($prog,$self),
                                cmd    => $cmd,
-                               debug  => "yes"
                               );
              }
           } else {
-             my @wild = ansi_match($first,$txt,$switch);
+             my @wild = ansi_match($first,$txt);
              if($#wild >=0) {
                 $cmd =~ s/\\,/,/g;
                 mushrun(self   => $self,
@@ -4260,8 +3949,7 @@ sub cmd_switch
                         match  => { 0 => @wild[0], 1 => @wild[1], 2 => @wild[2],
                                     3 => @wild[3], 4 => @wild[4], 5 => @wild[5],
                                     6 => @wild[6], 7 => @wild[7], 8 => @wild[8]
-                                  },
-                        debug  => 1,
+                                  }
                        );
                 return;
              }
@@ -4276,7 +3964,6 @@ sub cmd_switch
                   child  => 1,
                   invoker=> invoker($prog,$self),
                   cmd    => @list[0],
-                  debug  => 1,
                  );
           return;
        }
@@ -4307,10 +3994,10 @@ sub cmd_newpassword
 
       db_set($player,"obj_password",mushhash($2));
 
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "The password for %s has been updated.",name($player) ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "The password for %s has been updated.",name($player) ],
+           );
 
    } else {
       err($self,$prog,"usage: \@newpassword <player> = <new_password>");
@@ -4328,27 +4015,9 @@ sub cmd_telnet
 
    if(!$input && !$puppet) {
       return err($self,$prog,"Permission DENIED.");
-   } elsif($txt =~ /^\s*([^:]+?)\s*[:| ]\s*(\d+)\s*$/) {
-
-      # only allow one connection but optionally close the socket if it
-      # has been open to long and its not a SOCKET_PUPPET connection.
-      # SOCKET_PUPPET connection.
-      my $sock = find_socket($self,$prog);
-      if($sock ne undef) {
-         # sockets should be open only for a short time, unless its a
-         # SOCKET_PUPPET connection.
-         if(time() - @{@connected{$sock}}{opened} > 60 && 
-           !hasflag($self,"SOCKET_PUPPET")) {
-           printf("%s\n",print_var(@connected{$sock}));
-           server_disconnect($sock);   # socket has been open to long, close
-         } else {                                      # already open, abort
-            return err($self,
-                       $prog,
-                       "A \@telnet/url() connection is already open"
-                      );
-         }
-      }
-
+   } elsif(find_socket($self,$prog) ne undef) {
+      return err($self,$prog,"A \@telnet/url() connection is already open");
+   } elsif($txt =~ /^\s*([^:]+)\s*[:| ]\s*(\d+)\s*$/) {
       my ($host,$port) = ($1,$2);
 #      printf("cmd_telnet: opening connection to '$host:$port'\n");
 
@@ -4383,7 +4052,6 @@ sub cmd_telnet
 
       () = IO::Select->new($sock)->can_write(.2)    # see if socket is pending
           or @{@connected{$sock}}{pending} = 2;
-      con("PENDING: '%s'",@{@connected{$sock}}{pending});
 
       $readable->add($sock);                      # add to select() listener
       @info{io} = {} if(!defined @info{io});           # create input buffer
@@ -4391,10 +4059,10 @@ sub cmd_telnet
       @info{io}->{$sock}->{buffer} = [];
       return 1;
    } else {
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "usage: \@telnet <id>=<hostname>:<port> {$txt}" ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "usage: \@telnet <id>=<hostname>:<port> {$txt}" ],
+           );
       return 0;
    }
 }
@@ -4450,13 +4118,6 @@ sub cmd_send
        $txt =~ s/\r|\n//g;
        $txt =~ tr/\x80-\xFF//d;
 
-       if(!defined $$switch{quiet}) {
-           echo(self   => $self,
-                prog   => $prog,
-                source => [ "Send> %s\n", $txt ],
-            );
-       }
-
        if(defined $$switch{lf}) {
           printf($sock "%s\n",$txt);
        } elsif(defined $$switch{cr}) {
@@ -4481,10 +4142,10 @@ sub cmd_close
 
     server_disconnect($sock);
 
-    echo(self   => $self,
-         prog   => $prog,
-         source => [ "Socket Closed." ],
-        );
+    necho(self   => $self,
+          prog   => $prog,
+          source => [ "Socket Closed." ],
+         );
 }
 
 sub cmd_uptime
@@ -4500,11 +4161,11 @@ sub cmd_uptime
 
     my $minutes = int($diff / 60);
 
-    echo(self   => $self,
-         prog   => $prog,
-         source => [ "Uptime: %s days, %s hours, %s minutes",
-                     $days,$hours,$minutes ]
-        );
+    necho(self   => $self,
+          prog   => $prog,
+          source => [ "Uptime: %s days, %s hours, %s minutes",
+                      $days,$hours,$minutes ]
+         );
 }
 
 sub cmd_force
@@ -4561,7 +4222,7 @@ sub motd
    } else {                                        # evaluate the motd
       my $tmp = $$prog{read_only};                    # set readonly mode
       $$prog{read_only} = 1;
-      $atr = mush_eval($self,$prog,$atr);
+      $atr = evaluate($self,$prog,$atr);
 
       if($tmp eq undef) {
          delete @$prog{read_only};
@@ -4579,10 +4240,10 @@ sub cmd_list
    my ($self,$prog,$txt) = (obj(shift),shift,shift);
 
    if($txt =~ /^\s*motd\s*$/i) {
-      echo(self => $self,
-           prog => $prog,
-           source => [ "%s", motd($self,$prog) ]
-          );
+      necho(self => $self,
+            prog => $prog,
+            source => [ "%s", motd($self,$prog) ]
+           );
    } elsif($txt =~ /^\s*functions\s*$/i) {
        my $user;
        $Text::Wrap::columns=75;
@@ -4591,19 +4252,19 @@ sub cmd_list
        } else {
           $user = uc(join(' ',keys %{@info{mush_function}}));
        }
-       echo(self   => $self,
-            prog   => $prog,
-            source => [ "%s\n%s",
-                        wrap("Functions:     x",
-                             "                ",
-                             uc(list_functions())
-                            ),
-                        wrap("User-Functions: ",
-                             "                ",
-                             $user
-                            ),
-                      ]
-           );
+       necho(self   => $self,
+             prog   => $prog,
+             source => [ "%s\n%s",
+                         wrap("Functions:     x",
+                              "                ",
+                              uc(list_functions())
+                             ),
+                         wrap("User-Functions: ",
+                              "                ",
+                              $user
+                             ),
+                       ]
+            );
    } elsif($txt =~ /^\s*commands\s*$/i) {
       my %short;
 
@@ -4614,48 +4275,43 @@ sub cmd_list
       }
 
       $Text::Wrap::columns=75;
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "%s\n",
-                       wrap("Commands: ",
-                            "          ",
-                            uc(join(' ',sort keys %short))
-                           )
-                     ]
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "%s\n",
+                        wrap("Commands: ",
+                             "          ",
+                             uc(join(' ',sort keys %short))
+                            )
+                      ]
+           );
    } elsif($txt =~ /^\s*flags{0,1}\s*$/) {
        my @out;
 
        for my $key (keys %flag) {
           push(@out,$key . "(" . @flag{$key}->{letter} . ")");
        }
-       echo(self => $self,
-            prog => $prog,
-            source => [ "Flags: %s", join(', ',@out) ]
-           );
+       necho(self => $self,
+             prog => $prog,
+             source => [ "Flags: %s", join(', ',@out) ]
+            );
    } elsif(!hasflag($self,"WIZARD")) {
       return err($self,$prog,"Permission Denied.");
    } elsif($txt =~ /^\s*buffers{0,1}\s*$/) {
        my $hash = @info{io};
-       echo(self   => $self,
-            prog   => $prog,
-            source => [ "%s",print_var($hash) ],
-           );
+       necho(self   => $self,
+             prog   => $prog,
+             source => [ "%s",print_var($hash) ],
+            );
    } elsif($txt =~ /^\s*sockets\s*$/) {
          my $out;
          for my $key (keys %connected) {
             my $hash = @connected{$key};
-            $out .= sprintf("%s:%s [%s]\n   Opened: %s, Object: %s\n",
-                $$hash{hostname},
-                $$hash{port},
-                (($$hash{raw} == 0) ? "PLAYER" : "SOCKET"),
-                ts($$hash{start}),
-                (defined $$hash{obj_id}) ? obj_name($$hash{obj_id}) : "N/A");
+            $out .= "\n$$hash{hostname}:$$hash{port} -> '$$hash{start}' -> '$$hash{pending}'";
          }
-         echo(self   => $self,
-              prog   => $prog,
-              source => [ "%s",$out ],
-             );
+         necho(self   => $self,
+               prog   => $prog,
+               source => [ "%s",$out ],
+              );
    } elsif($txt =~ /^\s*(conf|config|configuration)\s*$/) {
       my $out;
       for my $key (sort grep {/^conf\./} keys %info) {
@@ -4666,15 +4322,15 @@ sub cmd_list
             $out .= sprintf("%-30s : %s\n",$key,single_line(@info{$key}));
          }
       }
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "%s", $out ]
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "%s", $out ]
+           );
    } elsif($txt =~ /^\s*last request\s*$/) {
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "%s", @info{socket_buffer} ]
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "%s", @info{socket_buffer} ]
+           );
    } else {
        err($self,
            $prog,
@@ -4704,10 +4360,10 @@ sub cmd_destroy
    my $name = name($target);
    my $loc = loc($target);
 
-   echo(self   => $self,
-        prog   => $prog,
-        source => [ "Destroyed %s", obj_name($target) ],
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         source => [ "Destroyed %s", obj_name($target) ],
+        );
    destroy_object($self,$prog,$target);
 }
 
@@ -4772,27 +4428,27 @@ sub cmd_toad
    #-----------------------------------------------------------------------#
    if($$cmd{toad_pos} >= $#db) {
       if($$cmd{toad_loc} ne loc($self)) {
-         echo(self       => $self,
-              prog       => $prog,
-              source     => [ "%s was \@toaded.",$$cmd{toad_objname} ],
-              all_room   => [ $$cmd{toad_loc},
-                              "%s was \@toaded.",
-                              $$cmd{toad_name}
-                            ],
-              all_room2  => [ $$cmd{toad_dbref}, "%s has left.",
-                              $$cmd{toad_name} ]
-             );
+         necho(self       => $self,
+               prog       => $prog,
+               source     => [ "%s was \@toaded.",$$cmd{toad_objname} ],
+               all_room   => [ $$cmd{toad_loc},
+                               "%s was \@toaded.",
+                               $$cmd{toad_name}
+                             ],
+               all_room2  => [ $$cmd{toad_dbref}, "%s has left.",
+                               $$cmd{toad_name} ]
+              );
       } else {
-         echo(self       => $self,
-              prog       => $prog,
-              source     => [ "%s was \@toaded.",$$cmd{toad_objname} ],
-              all_room   => [ $$cmd{toad_loc},
-                              "%s was \@toaded.",
-                              $$cmd{toad_name}
-                            ],
-              all_room2  => [ $$cmd{toad_dbref}, "%s has left.",
-                              $$cmd{toad_name} ]
-             );
+         necho(self       => $self,
+               prog       => $prog,
+               source     => [ "%s was \@toaded.",$$cmd{toad_objname} ],
+               all_room   => [ $$cmd{toad_loc},
+                               "%s was \@toaded.",
+                               $$cmd{toad_name}
+                             ],
+               all_room2  => [ $$cmd{toad_dbref}, "%s has left.",
+                               $$cmd{toad_name} ]
+              );
       }
       delete @player{trim(ansi_remove(lc($$cmd{toad_name2})))};
       db_delete($$cmd{toad_dbref});
@@ -4814,10 +4470,10 @@ sub cmd_think
    }
 
    if($txt !~ /^\s*$/) {
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "%s", $txt ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "%s", $txt ],
+           );
    }
 }
 
@@ -4843,10 +4499,10 @@ sub cmd_pemit
    my $txt = evaluate($self,$prog,trim($txt));
 
    if($txt !~ /^\s*$/) {
-      echo(self   => $self,
-           prog   => $prog,
-           target => [ $target, "%s", $txt ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            target => [ $target, "%s", $txt ],
+           );
    }
 }
 
@@ -4859,12 +4515,12 @@ sub cmd_emit
 
    my $txt = evaluate($self,$prog,$txt);
 
-   echo(self   => $self,
-        prog   => $prog,
-        source => [ "%s", $txt ],
-        room   => [ $self, "%s", $txt ],
-        always => 1,
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         source => [ "%s", $txt ],
+         room   => [ $self, "%s", $txt ],
+         always => 1,
+        );
 }
 
 sub cmd_drop
@@ -4897,14 +4553,14 @@ sub cmd_drop
                     name($target),name($target) ],
                   [ "Dropped." ]);
 
-#   echo(self    => $self,
-#        prog    => $prog,
-#        source  => [ "You have dropped %s.\n%s has arrived.",
-#                     name($target), name($target)
-#                   ],
-#        room    => [ $self, "%s dropped %s.", name($self),name($target) ],
-#        room2   => [ $self, "%s has arrived.",name($target) ]
-#       );
+#   necho(self    => $self,
+#         prog    => $prog,
+#         source  => [ "You have dropped %s.\n%s has arrived.",
+#                      name($target), name($target)
+#                    ],
+#         room    => [ $self, "%s dropped %s.", name($self),name($target) ],
+#         room2   => [ $self, "%s has arrived.",name($target) ]
+#        );
 
    cmd_look($target,$prog,undef,undef,1);
 }
@@ -4923,12 +4579,12 @@ sub cmd_leave
 
    cmd_go($self,$prog,"home") if($dest eq undef);
 
-   echo(self   => $self,
-        prog   => $prog,
-        room   => [ $self, "%s dropped %s", name($container),name($self) ],
-        room2  => [ $self, "%s has left.",name($self) ],
-        always => 1
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         room   => [ $self, "%s dropped %s", name($container),name($self) ],
+         room2  => [ $self, "%s has left.",name($self) ],
+         always => 1
+        );
 
 #   my ($self,$prog,$target,$dest,$type) = (obj($_[0]),obj($_[1]),obj($_[2]),$_[3]);
 
@@ -4936,12 +4592,12 @@ sub cmd_leave
       return err($self,$prog,"Internal error, unable to leave that object");
 
    # provide some visual feed back to the player
-   echo(self   => $self,
-        prog   => $prog,
-        room   => [ $self, "%s dropped %s.", name($container),name($self) ],
-        room2  => [ $self, "%s has arrived.",name($self) ],
-        always => 1
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         room   => [ $self, "%s dropped %s.", name($container),name($self) ],
+         room2  => [ $self, "%s has arrived.",name($self) ],
+         always => 1
+        );
 
    cmd_look($self,$prog,undef,undef,1);
 }
@@ -4990,19 +4646,19 @@ sub cmd_take
                   [ "Taken." ]                             # msg to enactor
                  );
 
-   echo(self   => $self,
-        prog   => $prog,
-        target => [ $target, "%s has picked you up.", name($self) ],
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         target => [ $target, "%s has picked you up.", name($self) ],
+        );
 
    teleport($self,$prog,$target,$self) ||
       return err($self,$prog,"Internal error, unable to pick up that object");
 
-   echo(self   => $self,
-        prog   => $prog,
-        room   => [ $target, "%s has arrived.",name($target) ],
-        always => 1
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         room   => [ $target, "%s has arrived.",name($target) ],
+         always => 1
+        );
 
    cmd_look($target,$prog,undef,undef,1);
 }
@@ -5070,10 +4726,10 @@ sub cmd_cpattr
           );
    }
    push(@out,"No matching attributes.") if($#out == -1);
-   echo(self   => $self,
-        prog   => $prog,
-        source => [ join("\n",@out) ]
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         source => [ join("\n",@out) ]
+        );
 }
 
 sub cmd_name
@@ -5115,10 +4771,10 @@ sub cmd_name
       db_set($target,"obj_cname",$cname);
 
       if(!defined $$switch{quiet}) {
-         echo(self   => $self,
-              prog   => $prog,
-              source => [ "Set." ],
-             );
+         necho(self   => $self,
+               prog   => $prog,
+               source => [ "Set." ],
+              );
       }
    } else {
       err($self,$prog,"syntax: \@name <object> = <new_name>");
@@ -5134,10 +4790,6 @@ sub cmd_enter
 
    my $target = find($self,$prog,$txt) ||
       return err($self,$prog,"I don't see that here.");
-
-   if($$target{obj_id} == $$self{obj_id}) {
-      return err($self,$prog,"You can't enter yourself!");
-   }
 
    # enter your own objects or things set ENTER_OK. This should be a
    # controls() for TinyMUSH compat but i'm against wizards entering that
@@ -5162,24 +4814,24 @@ sub cmd_enter
       }
    }
 
-   echo(self   => $self,
-        prog   => $prog,
-        room   => [ $self, "%s enters %s.",name($self),name($target)],
-        room2  => [ $self, "%s has left.", name($self) ],
-        always => 1,
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         room   => [ $self, "%s enters %s.",name($self),name($target)],
+         room2  => [ $self, "%s has left.", name($self) ],
+         always => 1,
+        );
 
    teleport($self,$prog,$self,$target) ||
       return err($self,$prog,"Internal error, unable to pick up that object");
 
    # provide some visual feed back to the player
-   echo(self   => $self,
-        prog   => $prog,
-        source => [ "You have entered %s.",name($target) ],
-        room   => [ $self, "%s entered %s.",name($self),name($target)],
-        room2  => [ $self, "%s has arrived.", name($self) ],
-        always => 1,
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         source => [ "You have entered %s.",name($target) ],
+         room   => [ $self, "%s entered %s.",name($self),name($target)],
+         room2  => [ $self, "%s has arrived.", name($self) ],
+         always => 1,
+        );
 
    cmd_look($self,$prog,undef,undef,1);
 }
@@ -5188,22 +4840,16 @@ sub cmd_to
 {
     my ($self,$prog,$txt) = (obj(shift),shift,shift);
 
-   
-    echo(self   => $self,
-         prog   => $prog,
-         source => [ "%s\n","\033[38;5;0m\033[48;5;244m F4 \033[38;5;0m\033[48;5;245m F5" ],
-         always => 1
-        );
     if($txt =~ /^\s*([^ ]+)\s*/) {
        my $tg = find($self,$prog,$1) ||
           return err($self,$prog,"I don't see that here.");
 
-       echo(self   => $self,
-            prog   => $prog,
-            source => [ "%s [to %s]: %s\n",name($self),name($tg),$' ],
-            room   => [ $self, "%s [to %s]: %s\n",name($self),name($tg),$' ],
-            always => 1
-           );
+       necho(self   => $self,
+             prog   => $prog,
+             source => [ "%s [to %s]: %s\n",name($self),name($tg),$' ],
+             room   => [ $self, "%s [to %s]: %s\n",name($self),name($tg),$' ],
+             always => 1
+            );
     } else {
        err($self,$prog,"syntax: `<person> <message>");
     }
@@ -5224,7 +4870,7 @@ sub whisper
    } elsif(loc($obj) != loc($self)) {
       return err($self,$prog,"%s is not here.",name($obj));
    } elsif($msg =~ /^\s*:/) {
-      echo(self   => $self,
+      necho(self   => $self,
             prog   => $prog,
             source => [ "%s senses, \"%s %s\"",
                         name($obj),name($self),trim($')
@@ -5233,7 +4879,7 @@ sub whisper
             always => 1,
            );
    } else {
-      echo(self   => $self,
+      necho(self   => $self,
             prog   => $prog,
             source => [ "You whisper, \"%s\" to %s.",trim($msg),name($obj) ],
             target => [ $obj, "%s whispers, \"%s\"",name($self),trim($msg) ],
@@ -5254,7 +4900,7 @@ sub whisper
 sub cmd_whisper
 {
    my ($self,$prog,$txt) = (obj(shift),shift,shift);
- 
+
    if($txt =~ /^\s*([^ ]+)\s*=/) {                           # standard whisper
       whisper($self,$prog,$1,$');
    } else {
@@ -5286,22 +4932,22 @@ sub page
 
    if($msg =~ /^\s*:\s*/) {
 
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "Long distance to %s: %s %s",name($target),
-                       name($self),$'
-                     ],
-           target => [ $target, "From afar, %s %s\n",name($self),$msg ],
-           always => 1,
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "Long distance to %s: %s %s",name($target),
+                        name($self),$'
+                      ],
+            target => [ $target, "From afar, %s %s\n",name($self),$msg ],
+            always => 1,
+           );
    } else {
       $msg =~ s/^\s*//g;
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "You paged %s with '%s'",name($target),$msg ],
-           target => [ $target, "%s pages: %s\n",name($self),$msg ],
-           always => 1,
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "You paged %s with '%s'",name($target),$msg ],
+            target => [ $target, "%s pages: %s\n",name($self),$msg ],
+            always => 1,
+           );
    }
 
    if(hasflag($self,"PLAYER")) {
@@ -5392,10 +5038,10 @@ sub cmd_last
    $out .= ("-" x ($max+1)) . "|-------------------|" .          # footer
            ("-" x 18) . "\n";
 
-   echo(self   => $self,
-        prog   => $prog,
-        source => [ "%s", $out ],
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         source => [ "%s", $out ],
+        );
 }
 
 
@@ -5423,14 +5069,14 @@ sub cmd_go
    }
 
    if($dest eq undef && $txt =~ /^home$/i) {
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "There's no place like home...\n" .
-                       "There's no place like home...\n" .
-                       "There's no place like home..."  ],
-           room   => [ $loc, "%s goes home.",name($self) ],
-           room2  => [ $loc, "%s has left.",name($self) ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "There's no place like home...\n" .
+                        "There's no place like home...\n" .
+                        "There's no place like home..."  ],
+            room   => [ $loc, "%s goes home.",name($self) ],
+            room2  => [ $loc, "%s has left.",name($self) ],
+           );
 
       $dest = home($self);
    } elsif($dest eq undef)  {
@@ -5451,13 +5097,13 @@ sub cmd_go
       if(dest($exit) eq undef) {
          return err($self,$prog,"That exit does not go anywhere");
       }
-      echo(self   => $self,
-           prog   => $prog,
-           room   => [ $self, "%s goes %s.",name($self),
-                       first(name($exit))
-                     ],
-           room2  => [ $self, "%s has left.",name($self) ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            room   => [ $self, "%s goes %s.",name($self),
+                        first(name($exit))
+                      ],
+            room2  => [ $self, "%s has left.",name($self) ],
+           );
    }
 
    # move it, move it, move it. I like to move it, move it.
@@ -5473,10 +5119,10 @@ sub cmd_go
                   [ "" ]);
 
    # provide some visual feed back to the player
-#   echo(self   => $self,
-#        prog   => $prog,
-#        room   => [ $self, "%s has arrived.",name($self) ]
-#       );
+#   necho(self   => $self,
+#         prog   => $prog,
+#         room   => [ $self, "%s has arrived.",name($self) ]
+#        );
 
    cmd_look($self,$prog,undef,undef,1);
 }
@@ -5521,18 +5167,18 @@ sub cmd_teleport
       return err($self,$prog,"Permission Denied.");
    }
 
-   echo(self   => $self,
-        prog   => $prog,
-        all_room   => [ $target, "%s has left.",name($target) ]
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         all_room   => [ $target, "%s has left.",name($target) ]
+        );
 
    teleport($self,$prog,$target,$location) ||
       return err($self,$prog,"Unable to teleport to that location");
 
-   echo(self   => $self,
-        prog   => $prog,
-        all_room   => [ $target, "%s has arrived.",name($target) ]
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         all_room   => [ $target, "%s has arrived.",name($target) ]
+        );
 
    cmd_look($target,$prog,undef,undef,1);
 }
@@ -5549,15 +5195,15 @@ sub cmd_print
    if(!hasflag($self,"WIZARD")) {
       err($self,$prog,"Permission denied.");
    } elsif($txt eq "connected") {
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "%s",print_var(\%connected) ]
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "%s",print_var(\%connected) ]
+           );
    } elsif($txt eq "connected_user") {
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "%s",print_var(\%connected_user) ]
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "%s",print_var(\%connected_user) ]
+           );
    } else {
       err($self,$prog,"Invalid variable '%s' specified.",$txt);
    }
@@ -5579,10 +5225,10 @@ sub cmd_clear
       printf("%s\n%s\n%s\n","#" x 65,"-" x 65,"#" x 65);
       printf("\033[2J");    #clear the screen
       printf("\033[0;0H");  #jump to 0,0
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "Done." ]
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "Done." ]
+           );
    }
 }
 
@@ -5638,10 +5284,10 @@ sub cmd_help
               cmd    => $'
              );
    } else {                                       # send help output to user
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "%s", $help ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "%s", $help ],
+           );
    }
 }
 
@@ -5655,14 +5301,14 @@ sub cmd_nohelp
          push(@result,$key);
       }
    }
-   echo(self   => $self,
-        prog   => $prog,
-        source => [ wrap("commands: ",
-                         "          ",
-                          join(', ',@result)
-                         )
-                  ]
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         source => [ wrap("commands: ",
+                          "          ",
+                           join(', ',@result)
+                          )
+                   ]
+        );
    delete @result[0 .. $#result];
    
    for my $key (sort keys %fun) {
@@ -5670,14 +5316,14 @@ sub cmd_nohelp
          push(@result,$key);
       }
    }
-   echo(self   => $self,
-        prog   => $prog,
-        source => [ wrap("functions: ",
-                         "           ",
-                          join(', ',@result)
-                         )
-                  ]
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         source => [ wrap("functions: ",
+                          "           ",
+                           join(', ',@result)
+                          )
+                   ]
+        );
    delete @result[0 .. $#result];
 }
 
@@ -5687,24 +5333,19 @@ sub cmd_pcreate
    my ($self,$prog,$txt,$switch,$flag) = (obj(shift),shift,shift,shift,shift);
 
    if($$user{site_restriction} == 3) {
-      printf("Got here: 1\n");
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "%s", conf("registration") ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "%s", conf("registration") ],
+           );
    } elsif($txt =~ /^\s*([^ ]+) ([^ ]+)\s*$/) {
-      printf("Got here: 2\n");
       if(inuse_player_name($1)) {
-         printf("Got here: 3\n");
          err($user,$prog,"That name is already in use.");
       } else {
-         printf("Got here: 4\n");
          $$user{obj_id} = create_object($self,$prog,$1,$2,"PLAYER");
          $$user{obj_name} = $1;
          cmd_connect($self,$prog,$txt) if !$flag;
       }
    } else {
-         printf("Got here: 5\n");
       err($user,$prog,"Invalid create command, try: create <user> <password> [$txt]");
    }
 }
@@ -5738,15 +5379,15 @@ sub cmd_create
    my $result = create_thing($self,$prog,$name,$value);
 
    if($result =~ /^(\d+)$/) {                                    # success
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "%s created as #%s.",obj_name($result),$result ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "%s created as #%s.",obj_name($result),$result ],
+           );
    } else {                                                         # error
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "%s", $result ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "%s", $result ],
+           );
    }
 }
 
@@ -5812,13 +5453,13 @@ sub cmd_link
       printf("Link: $$target{obj_id} -> $$dest{obj_id}\n");
       link_exit($self,$target,undef,$dest) ||
          return err($self,$prog,"Internal error while trying to link exit");
-      echo(self   => $self, prog   => $prog, source => [ "Set." ],);
+      necho(self   => $self, prog   => $prog, source => [ "Set." ],);
    } elsif(!hasflag($target,"EXIT") &&
       (controls($self,$dest)  || hasflag($dest,"ABODE"))) {
       printf("Link: $$target{obj_id} -> $$dest{obj_id}\n");
       set_home($self,$prog,$target,$dest) ||
          return err($self,$prog,"Internal error while trying to link exit");
-      echo(self   => $self, prog   => $prog, source => [ "set." ],);
+      necho(self   => $self, prog   => $prog, source => [ "set." ],);
    } else {
       return err($self,$prog,"Permission denied");
    }
@@ -5835,15 +5476,15 @@ sub cmd_dig
    my $result = dig_room($self,$prog,$room_name,$in,$out,$flag);
 
    if($result =~ /^(\d+)$/) {                                    # success
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "%s created as #%s.",obj_name($result),$result ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "%s created as #%s.",obj_name($result),$result ],
+           );
    } else {                                                         # error
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "%s", $result ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "%s", $result ],
+           );
    }
 }
 
@@ -5948,15 +5589,15 @@ sub cmd_open
    my $result = open_exit($self,$prog,loc($self),$name,$dbref);
    
    if($result =~ /^(\d+)$/) {                                    # success
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "Opened." ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "Opened." ],
+           );
    } else {                                                         # error
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "%s", $result ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "%s", $result ],
+           );
    }
 }
    
@@ -6093,7 +5734,7 @@ sub cmd_connect
 {
    my ($self,$prog,$txt,$switch) = (obj(shift),shift,shift,shift);
    my $sock = @$user{sock};
-   my ($atr,$player,$count,$connected);
+   my ($atr,$player,$count);
 
    if($txt =~ /^\s*"\s*([^"]+)\s*"\s+([^ ]+)\s*$/ ||    #parse player password
       $txt =~ /^\s*([^ ]+)\s+([^ ]+)\s*$/ ||            #parse player password
@@ -6147,13 +5788,6 @@ sub cmd_connect
                   motd($user,$prog),
                  );
 
-      echo_socket($user,
-                  $prog,
-                  "Last connect was from %s on %s\n\n",
-                  lastsite($user),
-                  lasttime($user)
-                 );
-                  
       cmd_mail($user,$prog,"short");
 
       if(defined conf("paycheck") && conf("paycheck") > 0) {
@@ -6162,10 +5796,10 @@ sub cmd_connect
          }
       }
 
-      echo(self   => $user,
-           prog   => $prog,
-           source => [ "\n" ]
-          );
+      necho(self   => $user,
+            prog   => $prog,
+            source => [ "\n" ]
+           );
 
       cmd_look($user,$prog);                                 # show room
 
@@ -6174,26 +5808,30 @@ sub cmd_connect
 
       # notify users local and users with monitor flag
       $$prog{cmd}->{source} = 0;
-
-      if(scalar keys %{@connected_user{$$self{obj_id}}} > 1) {
-         $connected = "re-connected"
-      } else {
-         $connected = "connected"
+      for my $key (keys %connected) {
+         if(defined @connected{$key} &&
+            $$user{obj_id} == @connected{$key}->{obj_id}) {
+            $count++;
+         }
       }
-
-      echo(self   => $user,
-           prog   => prog($user,$user),
-           room   => [ $user , "%s has $connected.",name($user) ],
-           source => [ "%s has $connected.", name($user) ],
-          );
+      if($count > 1) {
+         necho(self   => $user,
+               prog   => prog($user,$user),
+               room   => [ $user , "%s has re-connected.",name($user) ],
+               source => [ "%s has re-connected.", name($user) ],
+              );
+      } else {
+         necho(self   => $user,
+               prog   => prog($user,$user),
+               room   => [ $user , "%s has connected.",name($user) ],
+              );
+      }
       $$prog{cmd}->{source} = 1;
 
-      if(!hasflag($user,"NOMONITOR")) {
-         echo_flag($user,
-                   $prog,
-                   "CONNECTED,PLAYER,MONITOR",
-                   "[Monitor] %s has $connected.",name($user));
-      }
+      echo_flag($user,
+                $prog,
+                "CONNECTED,PLAYER,MONITOR",
+                "[Monitor] %s has connected.",name($user));
 
       # --- Handle @ACONNECTs on masteroom and players-----------------------#
 
@@ -6204,7 +5842,7 @@ sub cmd_connect
                        runas   => $obj,
                        invoker => $self,
                        source  => 0,
-                       cmd     => $atr,
+                       cmd     => $atr
                       );
             }
          }
@@ -6229,50 +5867,50 @@ sub cmd_doing
    my ($self,$prog,$txt,$switch) = (obj(shift),shift,shift,shift);
 
    if(hasflag($self,"GUEST")) {
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "Permission denieD." ]
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "Permission denieD." ]
+           );
    } elsif(defined $$switch{header} && $txt =~ /^\s*$/) {
       if(!hasflag($self,"WIZARD")) {
-          return echo(self   => $self,
-                      prog   => $prog,
-                      source => [ "Permission denIed." ]
-                     );
+          return necho(self   => $self,
+                       prog   => $prog,
+                       source => [ "Permission denIed." ]
+                      );
       }
       @info{"doing_header"} = $txt;
-      return echo(self   => $self,
-                  prog   => $prog,
-                  source => [ "Removed." ]
-                 );
+      return necho(self   => $self,
+                   prog   => $prog,
+                   source => [ "Removed." ]
+                  );
    } elsif(defined $$switch{header}) {
       if(!hasflag($self,"WIZARD")) {
-          return echo(self   => $self,
-                      prog   => $prog,
-                      source => [ "Permission deNied." ]
-                     );
+          return necho(self   => $self,
+                       prog   => $prog,
+                       source => [ "Permission deNied." ]
+                      );
       }
       @info{"doing_header"} = $txt;
-      return echo(self   => $self,
-                  prog   => $prog,
-                  source => [ "Set." ]
-                 );
+      return necho(self   => $self,
+                   prog   => $prog,
+                   source => [ "Set." ]
+                  );
    } elsif($txt =~ /^\s*$/) {
       for my $s (keys %{@connected_user{$$self{obj_id}}}) {
          delete @connected{$s}->{obj_doing};
       }
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "Removed." ]
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "Removed." ]
+           );
    } else {
       for my $s (keys %{@connected_user{$$self{obj_id}}}) {
          $connected{$s}->{obj_doing} = trim($txt);
       }
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "Set." ]
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "Set." ]
+           );
    }
 }
 
@@ -6324,9 +5962,9 @@ sub reconstitute
       $value !~ /\n/ &&
       ($pattern ne undef || $value  =~ /^\s*([\$|\[|^|!|@])/)) {
       if($1 eq "[") {
-         $value = "\n" . expand_function(3,single_line($value));
+         $value = "\n" . function_print(3,single_line($value));
       } else {
-         $value = "\n" . expand_code(3,single_line($value));
+         $value = "\n" . pretty(3,single_line($value));
       }
       $value =~ s/\n+$//;
    }
@@ -6518,10 +6156,10 @@ sub cmd_edit
    }
 
    push(@out,"No matching attribute") if($#out == -1);
-   echo(self   => $self,
-        prog   => $prog,
-        source => [ "%s",join("\n",@out) ],
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         source => [ "%s",join("\n",@out) ],
+        );
 }
 
 
@@ -6546,27 +6184,25 @@ sub cmd_ex
          return err($self,$prog,"I don't see that here. '$txt'");
    }
 
-   my $perm = (controls($self,$target) || 
-               readonly($self,$target) || 
-               hasflag($target,"VISUAL")) ? 1 : 0;
+   my $perm = (controls($self,$target) || readonly($self,$target)) ? 1 : 0;
 
    if($atr ne undef) {
       if($perm) {
-         return echo(self   => $self,
-                     prog   => $prog,
-                     source => [ "%s",list_attr($target,$atr,$sub,$switch)],
-                    );
+         return necho(self   => $self,
+                      prog   => $prog,
+                      source => [ "%s",list_attr($target,$atr,$sub,$switch)],
+                     );
       }
       return err($self,$prog,"Permission denied.");
    }
 
    if(hasflag($target,"ROOM") && !($perm || $$target{obj_id} == loc($self))) {
-      return echo(self   => $self,
-                  prog   => $prog,
-                  source => [ "%s is owned by %s.",
-                              name($target),
-                              name(owner($target))],
-                 );
+      return necho(self   => $self,
+                   prog   => $prog,
+                   source => [ "%s is owned by %s.",
+                               name($target),
+                               name(owner($target))],
+                  );
    }
 
    $out .= obj_name($self,$target,$perm);
@@ -6666,10 +6302,10 @@ sub cmd_ex
               "\n" . color("h","Location") . ": " .
               obj_name($self,loc_obj($target),$perm);
    }
-   echo(self   => $self,
-        prog   => $prog,
-        source => [ "%s", $out ]
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         source => [ "%s", $out ]
+        );
 }
 
 
@@ -6690,10 +6326,11 @@ sub cmd_inventory
       }
    }
 
-   echo(self   => $self,
-        prog   => $prog,
-        source => [ "%s\nYou have %s", $out,pennies($self) ],
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         source => [ "%s\nYou have %s", $out,pennies($self) ],
+        );
+
 }
 
 
@@ -6720,12 +6357,12 @@ sub cmd_look
 
    if(!hasflag($target,"ROOM") && loc($self) == $$target{obj_id}) {
       if(hasattr($target,"A_IDESC")) {
-         $out .= "\n" . mush_eval($self,$prog,get($$target{obj_id},"A_IDESC"));
+         $out .= "\n" . evaluate($self,$prog,get($$target{obj_id},"A_IDESC"));
       } elsif(hasattr($target,"idesc")) {
-         $out .= "\n" . mush_eval($self,$prog,get($$target{obj_id},"idesc"));
+         $out .= "\n" . evaluate($self,$prog,get($$target{obj_id},"idesc"));
       }
    } elsif(($desc = get($$target{obj_id},"DESCRIPTION")) && $desc ne undef) {
-      $out .= "\n" . mush_eval($target,$prog,$desc);
+      $out .= "\n" . evaluate($target,$prog,$desc);
    } else {
       $out .= "\nYou see nothing special.";
    }
@@ -6759,7 +6396,7 @@ sub cmd_look
       if(!set_digit_variables($self,$prog,"",join(' ',@con))) {# update to new
          $out .= "\n" . managed_var_set_error("#-1");
       } else {
-         $out .= "\n" . mush_eval($target,$prog,$attr);
+         $out .= "\n" . evaluate($target,$prog,$attr);
       }
       if(!set_digit_variables($self,$prog,"",$prev)) {    # restore %0 .. %9
          $out .= "\n" . managed_var_set_error("#-1");
@@ -6784,16 +6421,16 @@ sub cmd_look
             join("  ",@exit) if($#exit >= 0);  # add any exits
 
    if($always) {
-      echo(self   => $self,
-           prog   => $prog,
-           source => ["%s",$out ],
-           always => 1
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => ["%s",$out ],
+            always => 1
+           );
    } else {
-      echo(self   => $self,
-           prog   => $prog,
-           source => ["%s",$out ]
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => ["%s",$out ]
+           );
    }
 
    generic_action($self,
@@ -6853,12 +6490,12 @@ sub cmd_pose
    my $space = ($flag) ? "" : " ";
    my $pose = colorize($self,$prog,cf_convert(evaluate($self,$prog,$txt)));
 
-   echo(self   => $self,
-        prog   => $prog,
-        source => [ "%s%s%s",name($self),$space,$pose ],
-        room   => [ $self, "%s%s%s",name($self),$space,$pose ],
-        always => 1,
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         source => [ "%s%s%s",name($self),$space,$pose ],
+         room   => [ $self, "%s%s%s",name($self),$space,$pose ],
+         always => 1,
+        );
 }
 
 #
@@ -6877,7 +6514,6 @@ sub cmd_set
 
    # find attr name if provided
    my ($name,$attr) = balanced_split($obj,"\/",4);
-   $attr = ansi_remove($attr);
 
    my $switch = shift;
 
@@ -6895,23 +6531,19 @@ sub cmd_set
        if(!isatrflag($value)) {
           return err($self,$prog,"Invalid attribute flag");
        } else {
-         echo(self   => $self,
-              prog   => $prog,
-              source => [ "%s", set_atr_flag($target,$attr,$value,0,$switch) ]
-             );
+         necho(self   => $self,
+               prog   => $prog,
+               source => [ "%s", set_atr_flag($target,$attr,$value,0,$switch) ]
+              );
        }
    } else {                                                  # standard flag
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ set_flag($self,$prog,$target,$value,0,$switch) ]
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ set_flag($self,$prog,$target,$value,0,$switch) ]
+           );
    }
 }
 
-#
-# besplit (balanced evaluate split)
-#    Split a string at the $delimiter and then evaluate the results.
-#
 sub besplit
 {
    my ($self,$prog,$txt,$delim) = @_;
@@ -6920,10 +6552,6 @@ sub besplit
    return evaluate($self,$prog,$first), evaluate($self,$prog,$second);
 }
 
-#
-# bsplit
-#    balanced split shortcut
-#
 sub bsplit
 {
    return balanced_split($_[0],$_[1],4);
@@ -6951,7 +6579,6 @@ sub cmd_set2
 
    my ($attr,$obj) = bsplit($txt," ");
    my ($attr,$sub) = besplit($self,$prog,$attr,":");
-   $attr = ansi_remove($attr);
 
    if($sub ne undef) {
       # hash set
@@ -6978,10 +6605,10 @@ sub cmd_set2
       } else {
          db_set_hash($target,$attr,$sub,$value);               # add entry
       }
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "Set." ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "Set." ],
+           );
    } else {
       if($append && get($target,$attr) ne undef) {
          $append = get($target,$attr) . " ";
@@ -7103,12 +6730,12 @@ sub cmd_say
       $out = colorize($self,$prog,cf_convert(evaluate($self,$prog,$txt)));
    }
 
-   echo(self   => $self,
-        prog   => $prog,
-        source => [ "You say, \"%s\"",$out],
-        room   => [ $self, "%s says, \"%s\"",name($self),$out ],
-        always => 1
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         source => [ "You say, \"%s\"",$out],
+         room   => [ $self, "%s says, \"%s\"",name($self),$out ],
+         always => 1
+        );
 }
 
 sub get_source_checksums
@@ -7183,18 +6810,18 @@ sub reload_code
             con("*FAILED*\n%s\n",renumber_code($@)) if($self ne undef);
             @{$$curr{$key}}{chk} = -1;
             if($self ne undef) {
-               echo(self   => $self,
-                    prog   => $prog,
-                    source => [ "Reloading %-40s *FAILED*", $key ]
-                   );
+               necho(self   => $self,
+                     prog   => $prog,
+                     source => [ "Reloading %-40s *FAILED*", $key ]
+                    );
             }
          } else {
             if($self ne undef) {
                con("Successful\n");
-               echo(self   => $self,
-                    prog   => $prog,
-                    source => [ "Reloading %-40s Success", $key ]
-                   );
+               necho(self   => $self,
+                     prog   => $prog,
+                     source => [ "Reloading %-40s Success", $key ]
+                    );
             }
          }
       } else {
@@ -7210,6 +6837,7 @@ sub reload_code
    initialize_commands();
    initialize_ansi();
    initialize_flags();
+   find_free_dbrefs();
 
    return $count;
 }
@@ -7234,15 +6862,15 @@ sub cmd_reload_code
    $count = reload_code($self,$prog,$txt);
 
    if($count == 0) {
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "No code to load, no changes made." ]
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "No code to load, no changes made." ]
+           );
    } else {
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "%s re-loads %d subrountines.\n",name($self),$count ]
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            source => [ "%s re-loads %d subrountines.\n",name($self),$count ]
+           );
    }
 }
 
@@ -7330,93 +6958,20 @@ sub cmd_who
 {
    my ($self,$prog,$txt,$switch) = (obj(shift),shift,shift,shift);
 
-   echo(self   => $self,
-        prog   => $prog,
-        source => [ "%s", who($self,$prog,$txt) ]
-       );
-}
-
-sub starts_with
-{
-   my ($txt,$pat) = (lc(trim(shift)),lc(trim(shift)));
-
-   if(!defined $pat) {
-      return 1;
-   } elsif(length($pat) > length($txt)) {
-      return 0;
-   } elsif(substr($txt,0,length($pat)) eq $pat) {
-      return 1;
-   } else {
-      return 0;
-   }
-}
-
-#                                     Characters Input----  Characters Output---
-# Player Name        On For Idle Port Pend  Lost     Total  Pend  Lost     Total
-# Adrick           5d 13:28   0s   15    0     0     38092   160     0      3744
-# 6 Players logged in, 51 record, no maximum.
-sub cmd_SESSION
-{
-   my ($self,$prog,$txt,$switch) = @_;
-   my ($out, $idle, $extra, $online);
-   my $count = 0;
-
-   $out =  "                                    Characters Input----  ".
-           "Characters Output---\n";
-   $out .= "Player Name        On For Idle Port Pend  Lost     Total  Pend  " .
-           "Lost     Total\n";
-# Adrick           5d 13:28   0s   15    0     0     38092   160     0      3744
-
-   my $perm = hasflag($self,"WIZARD");
-   for my $key (sort {@{@connected{$b}}{start} <=> @{@connected{$a}}{start}}
-                keys %connected) {
-      my $player = @connected{$key};
-      $count++ if($perm || !hasflag($player,"DARK"));
-      if(($perm || $$self{obj_id} == $$player{obj_id}) &&
-         starts_with(name($player,1),$txt)) {
-         my $online = date_split(time() - fuzzy($$player{start}));
-         if($$online{max_abr} =~ /^(M|w|d)$/) {
-            $extra = sprintf("%2s",$$online{max_val} . $$online{max_abr});
-         } else {
-            $extra = "  ";
-         }
-         if(defined $$player{last}) {
-            $idle = date_split(time() - @{$$player{last}}{time});
-         } else {
-            $idle = { max_abr => 's' , max_val => 0 };
-         }
-         my $name = ansi_substr(name($player),0,16);
-         $out .= sprintf("%s%s %2s %02d:%02d %4s %4s\n",
-                         $name,
-                         " " x (16 - ansi_length($name)),
-                         $extra,
-                         $$online{h},
-                         $$online{m},
-                         $$idle{max_val} .  $$idle{max_abr},
-                         $$player{port});
-      }
-   }
-
-   if($count == 1) {
-      $out .= "1 Player logged in."
-   } else {
-      $out .= "$count Players logged in."
-   }
-
-   echo(self   => $self,
-        prog   => $prog,
-        source => [ "%s", $out ]
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         source => [ "%s", who($self,$prog,$txt) ]
+        );
 }
 
 sub cmd_DOING
 {
    my ($self,$prog,$txt,$switch) = (obj(shift),shift,shift,shift);
 
-   echo(self   => $self,
-        prog   => $prog,
-        source => [ "%s", who($self,$prog,$txt,1) ]
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         source => [ "%s", who($self,$prog,$txt,1) ]
+        );
 }
 
 sub who
@@ -7459,10 +7014,10 @@ sub who
 
    # show headers for normal / wiz who
    if($hasperm) {
-      $out .= sprintf("%-15s%10s%5s  %-*s %-4s %s\r\n","Player Name","On For",
+      $out .= sprintf("%-15s%10s%5s %-*s %-4s %s\r\n","Player Name","On For",
                       "Idle",$max,"Loc","Port","Hostname");
    } else {
-      $out .= sprintf("%-15s%10s%5s   %s\r\n","Player Name","On For","Idle",
+      $out .= sprintf("%-15s%10s%5s  %s\r\n","Player Name","On For","Idle",
                       defined @info{"doing_header"} ?
                       @info{"doing_header"} : "\@doing"
                      );
@@ -7500,14 +7055,12 @@ sub who
 
       # show connected user details
       if($hasperm) {
-         $out .= sprintf("%s%4s %02d:%02d %4s%s %-*s %-4s %s%s\r\n",
+         $out .= sprintf("%s%4s %02d:%02d %4s %-*s %-4s %s%s\r\n",
              $name,$extra,$$online{h},$$online{m},$$idle{max_val} .
-             $$idle{max_abr},hasflag($hash,"DARK") ? "D" : " ",$max,
-             "#" . loc($hash),$$hash{port},short_hn($$hash{hostname}),
+             $$idle{max_abr},$max,"#" . loc($hash),$$hash{port},
+             short_hn($$hash{hostname}),
              ($$hash{site_restriction} == 69) ? " [HoneyPoted]" : ""
             );
-      } elsif(hasflag($hash,"DARK")) {
-         # ignore
       } elsif($$hash{site_restriction} != 69) {
          my $doing = evaluate($self,$prog,$$hash{obj_doing});
          $doing =~ s/\r|\n//g;
@@ -7516,7 +7069,7 @@ sub who
              ansi_substr($doing,0,44));
       }
    }
-   $out .= sprintf("%d Players logged in.\r\n",$online);        # show totals
+   $out .= sprintf("%d Players logged in\r\n",$online);        # show totals
    delete @$prog{read_only} if !$readonly;
    delete @$prog{nomushrun} if !$nomushrun;
    return $out;
@@ -7552,11 +7105,12 @@ sub cmd_sweep
    push(@out,"Sweeping inventory...");
    sweep_obj($self,$self,\@out);
    push(@out,"Sweep Complete.");
-   echo(self   => $self,
-        prog   => $prog,
-        source => [ "%s", join("\n",@out) ]
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         source => [ "%s", join("\n",@out) ]
+        );
 }
+
 
 
 sub atr_case
@@ -7696,7 +7250,6 @@ sub flag_list
       my $hash = $$attr{value};
 
       # connected really isn't a flag, but should be
-      
       for my $key (sort {@flag{uc($a)}->{ord} <=> @flag{uc($b)}->{ord}}
                    keys %$hash) {
          push(@list,$flag ? uc($key) : flag_letter($key));
@@ -7853,23 +7406,6 @@ sub ansi_debug
     return $txt;
 }
 
-
-#
-# ansi_char
-#    Returns one character of the current string. Due to the nature of the
-#    ansi functions, this will only return characters not in ansi character
-#    strings. While this is silly to use a function to do this, this helps
-#    abstract the data set for situations in which the ansi functions are
-#    replaced by standard string functions.
-#
-sub ansi_char
-{
-   my ($data,$pos) = @_;
-
-   return @{$$data{ch}}[$pos];
-}
-
-
 sub is_ansi_string
 {
    my $txt = shift;
@@ -7914,32 +7450,39 @@ sub ansi_add
 {
    my ($data,$type,$txt) = @_;
 
+   if(ref($data) ne "HASH"   ||                           # insanity check
+      !defined $$data{ch}    ||
+      !defined $$data{state} ||
+      !defined $$data{code}  ||
+      !defined $$data{ch}) {
+      croak("Invalid data structure provided");
+   }
+
    my $ch   = $$data{ch};                      # make things more readable
    my $code = $$data{code};
    my $snap = $$data{snap};
 
+   # $ch will be the controlling array
    if($#$ch == -1 || $$ch[$#$ch] ne undef) {
       $$ch[$#$ch+1] = undef;
       $$code[$#$ch] = [];
       $$snap[$#$ch] = [];
    }
 
-   if($type) {
-     for my $c (split(//,$txt)) {                 # add multiple characters
-        $$ch[ $#$ch + ((@$ch[$#$ch] ne undef) ? 1 : 0) ] = $c;
-        @$code[$#$ch] = [] if(!defined @$code[$#$ch]);
-        @$snap[$#$ch] = [ @{@$data{state}} ];
-     }
-   } else {                                           # add escape sequence
-      push(@{$$code[$#$ch]},$txt);
-      if($txt eq "\e[0m") {
+   if(!$type) {                                           # add escape code
+      push(@{$$code[$#$ch]}, $txt);
+
+      if(substr($txt,1,3) eq "[0m") {
          $$data{state} = [];
       } else {
-         push(@{$$data{state}},$txt);
+         push(@{$$data{state}},$txt);            # keep track of current state
       }
+   } else {                                                 # add character
+      $$ch[$#$ch] = $txt;
+      $$snap[$#$ch] = [ @{@$data{state}} ];  # copy current state to char
    }
+   return length($txt);
 }
-
 
 #
 # ansi_init
@@ -7957,16 +7500,37 @@ sub ansi_add
 sub ansi_init
 {
    my $str = shift;
+   my $data = {
+      ch     => [],
+      code   => [],
+      state  => [],
+      snap   => []
+   };
 
-   my $data = { ch => [], code => [], state  => [], snap   => [] };
+   for(my ($len,$i)=(length($str),0);$i < $len;) {
+       if(ord(substr($str,$i,1)) eq 27) {                      # found escape
+          my $sub = substr($str,$i+1);
 
-   while($str =~ /\e\[([\d;]*)([a-zA-Z])/) {
-      $str = $';
-      ansi_add($data,1,$`) if $` ne undef;
-      ansi_add($data,0,"\e[$1$2");
+          # parse known escape sequences
+          if($sub =~ /^\[([\d;]*)([a-zA-Z])/) {
+             $i += ansi_add($data,0,chr(27) . "[" . $1 . $2);
+          } elsif($sub =~ /^([#O\(\)])([a-z0-9])/i) {
+             $i += ansi_add($data,0,chr(27) . $1 . $2);
+          } elsif($sub =~ /^(\[{0,1})([\?0-9]*);([0-9]*)([a-z])/i) {
+             $i += ansi_add($data,0,chr(27) . $1 . $2 . ";" . $3 . $4);
+          } elsif($sub =~ /^(\[{0,1})([\?0-9]*)([a-z])/i) {
+             $i += ansi_add($data,0,chr(27) . $1 . $2 . $3);
+          } elsif($sub =~ /^([\<\=\>78])/) {
+             $i += ansi_add($data,0,chr(27) . $1);
+          } elsif($sub =~ /^\/Z/i) {
+             $i += ansi_add($data,0,chr(27) . "\/Z");
+          } else {
+             $i++;                   # else ignore non-known escape codes
+          }
+      } else {
+         $i += ansi_add($data,1,substr($str,$i,1));          # non-escape code
+      }
    }
-   ansi_add($data,1,$str) if($str ne undef);
-
    return $data;
 }
 
@@ -8030,8 +7594,8 @@ sub ansi_string
 sub ansi_substr
 {
    my ($txt,$start,$count,$noansi) = @_;
-   my ($result,$data);
-   my $last = -1;
+   my ($result,$data,$last);
+   # foo
 
    if(ref($txt) eq "HASH") {
       $data = $txt;
@@ -8094,20 +7658,14 @@ sub ansi_length
 sub ansi_post_match
 {
    my ($data,$pat,@arg) = @_;
-   my ($pos,$wild,@wildcard);
+   my ($pos,$wild,@wildcard) = (0,0);
 
-   while($pat =~ /(\\*)(\*|\?)/ && $wild < 10) {
-      if(length($1) % 2 == 0) {
-         $pat = $';
-         $pos .= $`;
-         @info{debug} = 0;
-         push(@wildcard,ansi_substr($data,length($pos),length(@arg[$wild])));
-         $pos .= @arg[$wild];
-         $wild++;
-      } else {
-         $pat = $';
-         $pos .= $` . ("\\" x (length($1) / 2)) .  $2;
-      }
+   while($pat =~ /(\*|\?)/ && $wild < 10) {
+      $pat = $';
+      $pos += length($`) if($` ne undef);
+      push(@wildcard,ansi_substr($data,$pos,length(@arg[$wild])));
+      $pos += length(@arg[$wild]);
+      $wild++;
    }
 
    if($#wildcard > 8) {
@@ -8139,25 +7697,9 @@ sub ansi_post_match
 #
 sub ansi_match
 {
-   my ($txt,$pattern,$switch) = @_;
-   my $pat;
+   my ($txt,$pattern) = @_;
 
-
-   # ansi_match only works if we know the possible regexp options. When
-   # the user provides the pattern theres really no way outside of
-   # writing a regexp parser. Because of this, ansi escape sequences are
-   # removed but at least the match can still be made.
-   if(ref($switch) eq "HASH" && defined $$switch{regexp}) {
-      $pat = $pattern;
-
-      if(ansi_remove($txt) =~ /$pattern/) {
-         return $1, $2, $3, $4, $5, $6, $7, $8, $9;
-      } else {
-         return ();
-      }
-   } else {
-      $pat = glob2re($pattern);                    # convert pat to regexp
-   }
+   my $pat = glob2re($pattern);                    # convert pat to regexp
    my $str = ansi_init($txt);
    my $non = ansi_remove($txt);
 
@@ -8299,7 +7841,7 @@ sub ansi_trim
 # close(FILE);
 
 
-#my $str = "[32;1m|[0m [1m[34;1m<*>[0m [32;1m|[0m [31;1mA[0m[31ms[0m[31mh[0m[31me[0m[31mn[0m[33;1m-[0m[31;1mS[0m[31mh[0m[31mu[0m[31mg[0m[31mar[0m                   [32;1m|[0m Meetme(#260V)                        [32;1m|[0m";
+#my $str = "[32;1m|[0m [1m[34;1m<*>[0m [32;1m|[0m [31;1mA[0m[31ms[0m[31mh[0m[31me[0m[31mn[0m[33;1m-[0m[31;1mS[0m[31mh[0m[31mu[0m[31mg[0m[31mar[0m                   [32;1m|[0m Meetme(#260V)                        [32;1m|[0m";
 
 #for my $i (0 .. 78) {
 #   printf("%0d : '%s'\n",$i,ansi_length(ansi_substr($str,$i,7)));
@@ -8358,19 +7900,6 @@ sub initialize_flags
                           ord         => 30,
                           target_type => ""
                         };
-
-   @flag{DEBUG}        ={ letter      => "\@",
-                          perm        => "!GUEST",
-                          type        => 1,
-                          ord         => 31,
-                          target_type => ""
-                        };
-   @flag{DEBUG_FUN}       ={ letter      => "[DF]",
-                          perm        => "GOD",
-                          type        => 1,
-                          ord         => 31,
-                          target_type => ""
-                        };
    @flag{PLAYER}       ={ letter => "P", perm => "GOD",    type => 1, ord=>1  };
    @flag{ROOM}         ={ letter => "R", perm => "GOD",    type => 1, ord=>2  };
    @flag{EXIT}         ={ letter => "e", perm => "GOD",    type => 1, ord=>3  };
@@ -8385,7 +7914,6 @@ sub initialize_flags
    @flag{NOSPOOF}      ={ letter => "N", perm => "!GUEST", type => 1, ord=>14 };
    @flag{VERBOSE}      ={ letter => "v", perm => "!GUEST", type => 1, ord=>15 };
    @flag{MONITOR}      ={ letter => "M", perm => "WIZARD", type => 1, ord=>16 };
-   @flag{NOMONITOR}    ={ letter => "!", perm => "GOD",    type => 1, ord=>16 };
    @flag{SQL}          ={ letter => "Q", perm => "WIZARD", type => 1, ord=>17 };
    @flag{ABODE}        ={ letter => "A", perm => "!GUEST", type => 1, ord=>18 };
    @flag{LINK_OK}      ={ letter => "L", perm => "!GUEST", type => 1, ord=>19 };
@@ -8625,24 +8153,8 @@ sub get_next_dbref
 {
 
    if($#free > -1) {                        # prefetched list of free objects
-      my $dbref = shift(@free);
-     
-      return $dbref if(!valid_dbref($dbref));
-
-      # invalid free list, repopulate in the background.
-      my $self = obj(0);
-      mushrun(self   => $self,
-              runas  => $self,
-              invoker=> $self,
-              source => 0,
-              cmd    => "\@free",
-              from   => "ATTR",
-              hint   => "ALWAYS_RUN"
-             );
-   }
-         
-   # no objects in the free list, grab the next new dbref.
-   if(defined @info{backup_mode} && @info{backup_mode}) { # in backupmode
+      return shift(@free);
+   } elsif(defined @info{backup_mode} && @info{backup_mode}) { # in backupmode
       if($#delta > $#db) {                  # return the largest next number
          return $#delta + 1;                # in @delt or @db
       } else {
@@ -8679,8 +8191,6 @@ sub can_set_flag
       return 0;
    } elsif($$hash{perm} =~ /^!/) {     # can't have this perm flag and set flag
       return (!hasflag($self,$')) ? 1 : 0;
-   } elsif(!defined $$hash{perm} || $$hash{perm} eq undef) {
-      return 1;
    } else {                              # has to have this flag to set flag
       return (hasflag($self,$$hash{perm})) ? 1 : 0;
    }
@@ -8939,7 +8449,6 @@ sub db_set_flag
 
    return if $flag eq undef;
    croak() if($$id{obj_id} =~ /^HASH\(.*\)$/);
-
    $id = $$id{obj_id} if(ref($id) eq "HASH");
 
    my $obj = dbref_mutate($id);
@@ -9155,6 +8664,7 @@ sub db_object
 # db_process_line
 #   Read one line from the db at a time, storing any vital information
 #   in the state hash table.
+#
 #   When in a restore and an object number is passed in, then only that
 #   object is restored. The process will not die() when restoring.
 #
@@ -9171,8 +8681,6 @@ sub db_process_line
       my $type = $2;
       my $rest = $';
       $archive = 1;
-      $$state{archive} = {} if not defined $$state{archive};
-      $$state{archive}->{$1} = 1;                              # dirty bit
 
       if($type eq "delatr") {
          my $obj = @db[$$state{obj}];
@@ -9194,7 +8702,7 @@ sub db_process_line
       /^server: ([^,]+), version=([^,]+), change#=([^,]+), exported=([^,]+), type=/) {
       delete @$state{complete};                               # dump complete
       $$state{ver} = $2;
-      change($3) if defined $3 && $3 != 0;
+      @info{change} = $3;
    } elsif($line =~ /^\*\* Dump Completed (.*) \*\*$/) {
       $$state{complete} = 1;                                  # dump complete
       delete $$state{obj};
@@ -9227,7 +8735,7 @@ sub db_process_line
          for my $item (split(/,/,$list)) {
             db_set_list($$state{obj},$attr,$item,$created,$modified);
             if($attr eq "obj_flag" && $item =~ /^\s*(PLAYER|EXIT)\s*$/i) {
-               $$state{type} = uc($1);
+            $$state{type} = uc($1);
             }
          }
       }
@@ -9257,30 +8765,13 @@ sub db_process_line
       delete @$state{obj};
       delete @$state{type};
       delete @$state{loc};
+   } elsif($obj eq undef && $line =~ /^\s*$/) {
+      # ignore blank lines
    } elsif($obj eq undef) {
       con("Unable to parse[$$state{obj}]: '%s'\n",$line);
       printf("Unable to parse[$$state{obj}]: '%s'\n",$line);
       printf("%s\n",code("long"));
       die();
-   }
-}
-
-sub cleanup_archived_objects
-{
-   my $hash = shift;
-
-   return if(!defined $$hash{archive});
-
-   for my $key (keys %{$$hash{archive}}) {
-       my $attr = mget($key,"obj_flag");
-
-       if(defined $$attr{value}) {
-          my $flag = $$attr{value};
-
-          if(defined $$flag{player}) {
-             @player{lc(name($key))} = $key;
-          }
-      }
    }
 }
 
@@ -9302,7 +8793,7 @@ $SIG{'USR1'} = sub { @info{sigusr1} = time(); };
 
 END {
    if(@info{run} == 0) {
-      con("%s shutDOWN by %s.\n",conf("mudname"),@info{shutdown_by});
+      con("%s shutdown by %s.\n",conf("mudname"),@info{shutdown_by});
       do_full_dirty_dump();
       @info{crash_dump_complete} = 1;
    } elsif(!defined @info{crash_dump_complete} && $#db > -1) {
@@ -9320,15 +8811,16 @@ sub single_line
 
 sub run_obj_commands
 {
-   my ($self,$prog,$runas,$obj,$cmd,$flag)= (obj(shift),shift,shift,obj(shift),shift,shift);
-   $cmd =~ s/\r|\n|^\s+//g;
+   my ($self,$prog,$runas,$obj,$cmd)= (obj(shift),shift,shift,obj(shift),shift);
+   $cmd =~ s/\r|\n//g;
    my $match = 0;
 
    if(!or_flag($obj,"NO_COMMAND","HALTED")) {
+#      for my $hash (latr_regexp($obj,1)) {
       for my $hash (sort {length(@{$b}{atr_regexp}) <=>
                        length(@{$a}{atr_regexp})} latr_regexp($obj,1)) {
          if($cmd =~ /$$hash{atr_regexp}/i) {
-            # run attribute only if last run attribute isn't the new
+            # run attribute only if last run attritube isn't the new
             # attribute to run. I.e. infinite loop. Since we're not keeping
             # a stack of exec() attributes, this won't catch more complex
             # recursive calls. Future feature?
@@ -9338,13 +8830,13 @@ sub run_obj_commands
 
                # http head request requires just find the command, no run
                if(defined $$prog{ping} && $$prog{ping}) {
-                   echo(self   => $self,
-                        prog   => $prog,
-                        source => [ "PONG: \$command : %s/%s in %s",
-                                    obj_name($obj,$obj),
-                                    $$hash{atr_name},
-                                    obj_name(loc($obj),loc($obj)) ]
-                       );
+                   necho(self   => $self,
+                         prog   => $prog,
+                         source => [ "PONG: \$command : %s/%s in %s",
+                                     obj_name($obj,$obj),
+                                     $$hash{atr_name},
+                                     obj_name(loc($obj),loc($obj)) ]
+                        );
                } elsif(!defined $$prog{head}) {
                    mushrun(self   => $self,
                            prog   => $prog,
@@ -9410,7 +8902,7 @@ sub mush_command
    my ($self,$prog,$runas,$cmd,$src) = @_;
    my $match = 0;
 
-   return 0 if(conf_true("safemode") || conf_true("TALKER"));
+   return if(conf_true("safemode"));
    $cmd = evaluate($self,$prog,$cmd) if($src ne undef && $src == 0);
 
    if(conf_true("master_override")) {            # search master room first
@@ -9420,7 +8912,7 @@ sub mush_command
    }
 
    # search player
-   run_obj_commands($self,$prog,$runas,$self,$cmd,1) && return 1;
+   run_obj_commands($self,$prog,$runas,$self,$cmd) && return 1;
 
    # search player's contents
    for my $obj (lcon($self)) {
@@ -9501,6 +8993,7 @@ sub mushrun_add_cmd
                    prog    => $$arg{prog},
                    mdigits => $$arg{match}
                  };
+
       if(conf_true("debug")) {
          #
          # Extra Debuging to trace calls back to the begining, when needed.
@@ -9523,30 +9016,18 @@ sub mushrun_add_cmd
          $$data{cmd} = @cmd[$#cmd - $i];
          unshift(@$stack,$data);
          $$prog{mutated} = 1;                # current cmd changed location
-#	 printf("add[1-%s]: '%s'\n",@{$$data{invoker}}{obj_id},@cmd[$#cmd - $i]);
-#         printf("%s\n",print_var($stack,,,{invoker=>1,wild=>1}));
-#         printf("%s\n",show($stack,{invoker=>1,wild=>1,runas=>1,switch=>1,user=>1,created_by=>1,command_duration=>1,var=>1,mdigits=>1,stack=>1}));
-#         printf("---[ stack start ]----\n");
-#         for my $i ( 0 .. $#$stack ) {
-#            if(defined $$prog{iter_stack}) {
-#               printf("   $i : %s [%s]\n",$$stack[$i]->{cmd},
-#                  $$prog{iter_stack}->[0]->{val});
-#            } else {
-#               printf("   $i : %s\n",$$stack[$i]->{cmd});
-#            }
-#         }
-#         printf("---[ stack end ]----\n");
+	 # printf("add[1-%s]: '%s'\n",@{$$data{invoker}}{obj_id},@cmd[$#cmd - $i]);
       } elsif($$arg{child} == 2) {                  # add after current cmd
          $$data{cmd} = @cmd[$#cmd - $i];
          my $current = $$prog{cmd};
          for my $i (0 .. $#$stack) {             #find current cmd in stack
             splice(@$stack,$i+1,0,$data) if($current eq $$stack[$i]);
          }
-#	 printf("add[2-%s]: '%s'\n",@{$$data{invoker}}{obj_id},@cmd[$#cmd - $i]);
+	 # printf("add[2-%s]: '%s'\n",@{$$data{invoker}}{obj_id},@cmd[$#cmd - $i]);
       } else {                                              # add to bottom
          $$data{cmd} = @cmd[$i];
          push(@$stack,$data);
-#	 printf("add[3-%s]: '%s'\n",@{$$data{invoker}}{obj_id},@cmd[$i]);
+	 # printf("add[3-%s]: '%s'\n",@{$$data{invoker}}{obj_id},@cmd[$i]);
       }
    }
 }
@@ -9626,10 +9107,6 @@ sub mushrun
       @arg{cmd} = $1 if(ansi_remove($arg{cmd}) =~ /^\s*{(.*)}\s*$/s);
    }
 
-   my $tmp = @arg{cmd};
-   $tmp =~ s/\s+/ /g;
-   $tmp =~ s/\r|\n//g;
-
    if(@arg{prog} eq undef) {                                       # new prog
       $prog = prog(@arg{self},@arg{runas});
       @arg{prog} = $prog;
@@ -9643,23 +9120,21 @@ sub mushrun
       }
    }
 
+
    if(!defined @arg{invoker}) {              # handle who issued the command
       if(defined $$prog{cmd} && defined @$prog{cmd}->{invoker}) {
          @arg{invoker} = @$prog{cmd}->{invoker};
 #         printf("     INVOKER1: '%s'\n",@arg{invoker});
       } elsif(defined $$prog{invoker}) {
          @arg{invoker} = $$prog{invoker};
-         printf("     INVOKER2: '%s'\n",@arg{invoker});
+#         printf("     INVOKER2: '%s'\n",@arg{invoker});
       } else {
-#         con("     INVOKER: NONE '%s' -> '%s'\n",@arg{invoker},code());
+         con("     INVOKER: NONE '%s' -> '%s'\n",@arg{invoker},code());
       }
     } else {
 #         printf("     INVOKER: ALREADY SET\n",@arg{invoker});
     }
 
-   if(defined $$prog{arg} && scalar keys %{$$prog{arg}} == 0) {
-      delete @$prog{arg};
-   }
    # copy over program level data
    for my $i ("hint", "attr", "sock", "output", "from") {
       if(defined @arg{$i} && !defined $$prog{$i}) {
@@ -9684,16 +9159,13 @@ sub mushrun
          $$prog{invoking_command} = @arg{cmd};
       }
       mushrun_add_cmd(\%arg,@arg{cmd});
-   } elsif(!conf_true("TALKER")) {            # non-user input, slice and dice
+   } else {                                   # non-user input, slice and dice
       mushrun_add_cmd(\%arg,balanced_split(@arg{cmd},";",3,1));
    }
 
 #   if(defined $arg{wild}) {
 #      set_digit_variables($arg{self},$arg{prog},"",@{$arg{wild}}); # copy %0-%9
 #   }
-
-   serial_canrun(@arg{prog});                            # creates the lock
-
    return @arg{prog};
 }
 
@@ -9765,8 +9237,6 @@ sub mushrun_done
    my $cost = ($$prog{command} + ($$prog{function} / 10)) / 128;
    my $attr;
 
-   serial_delete($prog);
-
 #   if(defined $$prog{attr}) {
 #      printf("%s\n",print_var($prog));
 #   }
@@ -9807,14 +9277,6 @@ sub mushrun_done
          } elsif(defined $$prog{get} && $$prog{get} =~ /^\~/) {
             http_out($$prog{sock},"%s",join("",@{@$prog{output}}));
             http_disconnect($$prog{sock});
-         } elsif(defined $$prog{get} && 
-                 $$prog{get} =~ /\.(js|css)$/i ||
-                 $$prog{get} =~ /_raw\.(html)$/i) {
-            http_reply_simple($$prog{sock},
-                              $1,
-                              "%s",
-                              join("\n",@{@$prog{output}})
-                             );
          } else {
             http_reply($prog,"%s",join("",@{@$prog{output}}));
          }
@@ -9830,13 +9292,13 @@ sub mushrun_done
       my $f = $$prog{missing}->{fun};
       my $flist = join(', ',keys %$f);
       $flist = "None" if $flist eq undef;
-      echo(self   => $$prog{created_by},
-           prog   => $prog,
-           target => [ $$prog{created_by}, "Missing commands: %s\n".
-                       "Missing functions: %s",
-                       $clist,$flist
-                     ]
-          );
+      necho(self   => $$prog{created_by},
+            prog   => $prog,
+            target => [ $$prog{created_by}, "Missing commands: %s\n".
+                        "Missing functions: %s",
+                        $clist,$flist
+                      ]
+           );
    }
    close_telnet($prog);
    delete @engine{$$prog{pid}};
@@ -9854,11 +9316,11 @@ sub spin_done
 sub spin
 {
    my $start = Time::HiRes::gettimeofday();
-   my ($count,$pid,$result,$id);
+   my ($count,$pid,$result);
 
    $SIG{ALRM} = \&spin_done;
 
-   eval {
+#   eval {
        ualarm(15_000_000);                              # err out at 8 seconds
        local $SIG{__DIE__} = sub {
           delete @engine{@info{current_pid}};
@@ -9891,37 +9353,18 @@ sub spin
       } elsif(time()-@info{dirty_time} > 300 && defined @info{dump_name}) {
          @info{dirty_time} = time();
          my $self = obj(0);
-         if(conf_true("archive_logging")) {
-            
-            mushrun(self   => $self,
-                    runas  => $self,
-                    invoker=> $self,
-                    source => 0,
-                    cmd    => "\@dirty_dump",
-                    from   => "ATTR",
-                    hint   => "ALWAYS_RUN"
-                   );
-         }
+         mushrun(self   => $self,
+                 runas  => $self,
+                 invoker=> $self,
+                 source => 0,
+                 cmd    => "\@dirty_dump",
+                 from   => "ATTR",
+                 hint   => "ALWAYS_RUN"
+         );
       }
 
-      if(@info{standby} && time() - @info{archive_time} > 300) {
-         @info{archive_time} = time();
-         load_pending_archive_log();
-      }
 
-      # nothing to do, move on.
-      return if(keys %engine == 0);
-
-   
-      # The mush might run out of time before finishing everything and
-      # everyone should get a turn. Make a list and run everything once.
-      # Repeat.
-
-      if(!defined @info{toprocess} || $#{@info{toprocess}} == -1 ) {
-         @info{toprocess} = [ sort {$a <=> $b} keys %engine ];
-      }
-
-      while(($pid = pop(@{@info{toprocess}}))) {
+      for $pid (sort {$a cmp $b} keys %engine) {
          @info{current_pid} = $pid;
 
          if(defined @info{timeout_pid} && @info{timeout_pid} == $pid) {
@@ -9931,13 +9374,9 @@ sub spin
          my $prog = @engine{$pid};
          my $stack = $$prog{stack};
          my $pos = 0;
-         my $flip = 0;
          $count = 0;
          @info{prog} = @engine{$pid};
 
-
-         next if(!serial_canrun($prog));
-         
          # run 100 commands, backgrounded command are excluded because
          # someone could put 100 waits in for far in the furture, the code
          # would never run the next command.
@@ -9952,11 +9391,6 @@ sub spin
 
             # optimization for sleeping process
             last if(defined $$cmd{sleep} && $$cmd{sleep} > time());
-
-            # run object $attribute pairs one at a time till they complete
-            # and then run the next one. Que spam protection.
-            last if(!serial_canrun($prog));
-
             if(!hasflag($$cmd{runas},"HALTED")) {
                $result = spin_run($prog,$cmd);
             }
@@ -9977,8 +9411,8 @@ sub spin
             delete @$prog{mutated} if defined @$prog{mutated};
 
             if(Time::HiRes::gettimeofday() - $start >= 1) { # stop
-#               con("   Time slice ran long, exiting correctly [%d cmds]\n",
-#                      $count);
+               con("   Time slice ran long, exiting correctly [%d cmds]\n",
+                      $count);
                mushrun_done($prog) if($#$stack == -1);     # program is done
                ualarm(0);
                @info{timeout_pid} = $pid;
@@ -9990,7 +9424,7 @@ sub spin
          delete @info{prog};
       }
       ualarm(0);
-   };
+#   };
 
    if($@ =~ /alarm/i) {
       con("Time slice timed out (%2f w/%s cmd) $@\n",
@@ -9998,26 +9432,20 @@ sub spin
    }
 }
 
-#
-# show_verbose
-#   If an object is set verbose, show the commands being run to the owner.
-#
 sub show_verbose
 {
    my ($prog,$command) = @_;
 
    if(hasflag($$command{runas},"VERBOSE")) {
-      my $owner = owner($$command{runas});
-      if(hasflag($owner,"CONNECTED")) {
-         echo(self   => $owner,
-              prog   => $prog,
-              target => [ $owner,
-                          "%s] %s",
-                          name($$command{runas}),
-                          $$command{cmd}
-                        ]
-             );
-      }
+      my $owner= owner($$command{runas});
+      necho(self   => $owner,
+            prog   => $prog,
+            target => [ $owner,
+                        "%s] %s",
+                        name($$command{runas}),
+                        $$command{cmd}
+                      ]
+           );
    }
 }
 
@@ -10072,20 +9500,20 @@ sub run_internal
                                  "",
                                  @{$$command{wild}}
                                 )) {
-             echo(self   => $target,
-                  prog   => $prog,
-                  source => [ managed_var_set_error("#-1") ]
-                 );
+             necho(self   => $target,
+                   prog   => $prog,
+                   source => [ managed_var_set_error("#-1") ]
+                  );
              return;
          }
       }
 
       # command is just a @ping, echo to user but do not run.
       if(defined $$prog{ping} && $$prog{ping}) {
-         echo(self   => $$command{created_by},
-              prog   => $prog,
-              source => [ "PONG: \@command : Internal Command" ]
-             );
+         necho(self   => $$command{created_by},
+               prog   => $prog,
+               source => [ "PONG: \@command : Internal Command" ]
+              );
          return;
       }
       $target = $$target{obj_id} if(ref($target) eq "HASH");
@@ -10147,7 +9575,7 @@ sub spin_run
    my ($hash,$arg,%switch);
    $$cmd{origcmd} = $$cmd{cmd};
    $$prog{cmd} = $cmd;
-#   printf("RUN[%s] %s -> %s\n",$$prog{pid},obj_name($$cmd{runas}),substr($$cmd{cmd},1,40));
+#   printf("RUN %s -> %s\n",obj_name($$cmd{runas}),$$cmd{cmd});
 
    # determine which command set to use
    if($$prog{hint} eq "WEB" || $$prog{hint} eq "WEBSOCKET") {
@@ -10179,7 +9607,6 @@ sub spin_run
    $$cmd{cmd} =~ s/^\s+//g;                            # strip leading spaces
    $$cmd{cmd} =~ s/^\\//g if($$cmd{source} == 0);          # fix for escape()
    $$cmd{cmd} = parse_switch($cmd,$$cmd{cmd});
-   $$cmd{cmd} =~ s/^\s+//g;                            # strip leading spaces
    my ($first,$arg) = bsplit($$cmd{cmd}," ");
    $$cmd{mushcmd} = $first;
 
@@ -10215,10 +9642,10 @@ sub spin_run
       return 1;                                   # mush_command runs command
    } else { # no match, show HUH?
       if(defined $$prog{ping} && $$prog{ping}) {
-         echo(self   => $$cmd{created_by},
-              prog   => $prog,
-              source => [ "PONG: No matching command found." ]
-             );
+         necho(self   => $$cmd{created_by},
+               prog   => $prog,
+               source => [ "PONG: No matching command found." ]
+              );
          return;
       }
       return cmd_huh($$cmd{runas},$prog,$$cmd{cmd});
@@ -10426,6 +9853,232 @@ sub find_player
    return obj($partial);
 }
 
+#
+# balanced_split
+#    Split apart a string but allow the string to have "",{},()s
+#    that keep segments together... but only if they have a matching
+#    pair.
+#
+sub fmt_balanced_split
+{
+   my ($txt,$delim,$type,$debug) = @_;
+   my ($last,$i,@stack,@depth,$ch,$buf) = (0,-1);
+
+   my $size = length($txt);
+   while(++$i < $size) {
+      $ch = substr($txt,$i,1);
+
+      if($ch eq "\\") {
+         $buf .= substr($txt,$i++,2);
+         next;
+      } else {
+         if($ch eq "(" || $ch eq "{") {                  # start of segment
+            $buf .= $ch;
+            push(@depth,{ ch    => $ch,
+                          last  => $last,
+                          i     => $i,
+                          stack => $#stack+1,
+                          buf   => $buf
+                        });
+         } elsif($#depth >= 0) {
+            $buf .= $ch;
+            if($ch eq ")" && @{@depth[$#depth]}{ch} eq "(") {
+               pop(@depth);
+            } elsif($ch eq "}" && @{@depth[$#depth]}{ch} eq "{") {
+               pop(@depth);
+            }
+         } elsif($#depth == -1) {
+            if($ch eq $delim) {    # delim at right depth
+               push(@stack,$buf . $delim);
+               $last = $i+1;
+               $buf = undef;
+            } elsif($type <= 2 && $ch eq ")") {                   # func end
+               push(@stack,$buf);
+               $last = $i;
+               $i = $size;
+               $buf = undef;
+               last;                                      # jump out of loop
+            } else {
+               $buf .= $ch;
+            }
+         } else {
+            $buf .= $ch;
+         }
+      }
+      if($i +1 >= $size && $#depth != -1) {   # parse error, start unrolling
+         my $hash = pop(@depth);
+         $i = $$hash{i};
+         delete @stack[$$hash{stack} .. $#stack];
+         $last = $$hash{last};
+         $buf = $$hash{buf};
+      }
+   }
+
+   if($type == 3) {
+      push(@stack,substr($txt,$last));
+      return @stack;
+   } else {
+      unshift(@stack,substr($txt,$last));
+      return ($#depth != -1) ? undef : @stack;
+   }
+}
+
+#
+# dprint
+#    Return a string that is at the proper "depth". Some generic mush
+#    formating is also done here.
+#
+sub dprint
+{
+    my ($depth,$fmt,@args) = @_;
+    my $out;
+
+    my $txt = sprintf($fmt,@args);
+
+    if($depth + length($txt) < conf("max")) {           # short, copy it as is.
+#        $out .= sprintf("%s%s [%s]\n"," " x $depth,$txt,code());
+        $out .= sprintf("%s%s\n"," " x $depth,$txt);
+                                         # Text enclosed in {}, split apart?
+    } elsif($txt =~ /^\s*{\s*(.+?)}\s*([;,]{0,1})\s*$/s) {
+        my ($grouped,$ending) = ($1,$2);
+        $txt = pretty($depth+3,$grouped);
+        $txt =~ s/^\s+//;
+        $out .= sprintf("%s{  %s"," " x $depth,$txt);
+        $out .= sprintf("%s}%s\n"," " x $depth,$ending);
+    } else {                                    # generic text, wrapping it
+       # $out .= sprintf("%s%s\n"," " x $depth,$txt);
+       $out .= wrap(" " x $depth," " x ($depth+3),$txt) . "\n";
+    }
+    return $out;
+}
+
+#
+# fmt_dolist
+#    Handle formating for @dolist like
+#
+#    @dolist list =
+#        @commands
+#
+sub fmt_dolist
+{
+    my ($depth,$cmd,$txt) = @_;
+    my $out;
+
+    # to short, don't seperate
+    if($depth + length($cmd . " " . $txt) < conf("max")) {
+       return dprint($depth,$cmd . " " . $txt);
+    }
+
+                                               # find '=' at the right depth
+    my @array = fmt_balanced_split($txt,"=",3);
+
+    $out .= dprint($depth,"%s %s",$cmd,trim(@array[0]));    # show cmd + list
+
+    if($#array >= 0) {                                 # show commands to run
+       $out .= pretty($depth+3,join('',@array[1 .. $#array]));
+    }
+    return $out;
+}
+
+sub fmt_while
+{
+   my ($depth,$cmd,$txt) = @_;
+   my $out;
+
+   if($txt =~ /^\s*\(\s*(.*?)\s*\)\s*{\s*(.*?)\s*}\s*(;{0,1})\s*$/s) {
+      $out .= dprint($depth,"%s ( %s ) {",$cmd,$1);
+      $out .= pretty($depth+3,$2);
+      $out .= dprint($depth,"}%s",$3);
+      return $out;
+   } else {
+      return dprint($depth,"%s",$cmd . " " . $txt);
+   }
+}
+
+#
+# fmt_switch
+#   Handle formating for @switch/select
+#
+#   @select value =
+#       text,
+#          commands,
+#       text,
+#          commands
+#
+sub fmt_switch
+{
+    my ($depth,$cmd,$txt) = @_;
+    my $out;
+
+    # to small, do nothing
+    if(length($txt)+$depth + 3 < conf("max")) {
+       return dprint($depth,"%s %s",$cmd,$txt);
+    }
+
+    # split up command by ','
+    my @list = fmt_balanced_split($txt,',',3);
+
+    # split up first segment again by "="
+    my ($first,$second) = fmt_balanced_split(shift(@list),'=',3);
+
+
+    my $len = $depth + length($cmd) + 1;                  # first subsegment
+    if($len + length($first)  > conf("max")) {                 # multilined
+        $first =~ s/=\s*$//g;
+       $out .= dprint($depth,
+                      "%s %s=",
+                      $cmd,
+                      substr(noret(function_print($len-3,trim($first))),$len)
+                     );
+    } else {                                                  # single lined
+       $out .= dprint($depth,"%s %s",$cmd,trim($first),code());
+    }
+
+
+    $out .= dprint($depth+3,"%s",$second);               # second subsegment
+
+    # show the rest of the segments at alternating depths
+    for my $i (0 .. $#list) {
+       my $indent = ($i % 2 == 0) ? 6 : 3;
+
+       if($i % 2 == 1) {
+          if($i == $#list) {                        # default test condition
+             $out .= dprint($depth+3,"DEFAULT" . ",");
+             $out .= dprint($depth+6,"%s",@list[$i]);
+          } else {                                          # test condition
+             $out .= dprint($depth+3,"%s",@list[$i]);
+          }
+       } elsif($depth + $indent + length(@list[$i]) > conf("max") || # long cmd
+               @list[$i] =~ /^\s*{.*}\s*;{0,1}\s*$/) {
+          $out .= pretty($depth+6,@list[$i]);
+       } else {                                                  # short cmd
+          $out .= dprint($depth + 6,"%s",@list[$i]);
+       }
+    }
+
+    return $out;
+}
+
+sub fmt_amper
+{
+   my ($depth,$cmd,$txt) = @_;
+   my $out;
+
+   if($txt =~ /^([^ ]+)\s+([^=]+)\s*=/) {
+      my ($atr,$obj,$val) = ($1,$2,$');
+
+      if(length($val) + $depth < conf("max")) {
+         $out .= dprint($depth,"%s","$cmd$txt");
+      } elsif($val =~ /^\s*\[.*\]\s*(;{0,1})\s*$/) {
+         $out .= dprint($depth,"%s","&$atr $obj=");
+         $out .= function_print($depth+3,$val);
+      } else {
+         $out .= dprint($depth,"%s",$cmd . $txt);
+      }
+   }
+
+   return $out;
+}
 
 #
 # noret
@@ -10437,560 +10090,238 @@ sub noret
    return $txt;
 }
 
-# -----[mec start]-------------------------------------------------------- #
-
 #
-# d
-#   Quick function to take a depth value and print out a coresponding
-#   number of spaces. Optionally, print out some text afterwards.
+# function_print_segment
+#    Maybe this function should be called function_print as this
+#    function is really just printing out the function.
 #
-sub d
+sub function_print_segment
 {
-   my ($depth,$fmt,@args) = @_;
-
-   return sprintf("%*s%s",$depth,"",$fmt) if($#args == -1 && $fmt =~ /%/);
-   return sprintf("%*s$fmt",$depth,"",@args);
-}
-
-#
-# ltrim
-#    Remove any leading spaces from the specified string.
-#
-sub ltrim
-{
-   my $txt = shift;
-   $txt =~ s/^ +//;
-   return $txt;
-}
-
-#
-# fmt_equal
-#
-sub fmt_equal
-{
-   my ($depth,$cmd,$rest) = @_;
-   my ($out,$fmt,$space);
-
-   my ($first,$second) = balanced_split($rest,"=",4);
-
-   if($first =~ /^(\s+)/) {                             # preserve spaces?
-      $space = $1;
-      $first = $';
-   }
-
-   if($second ne undef) {                            # split at equal sign
-     my $fun = expand_function($depth+3,$first);
-
-     if($fun =~ /\n/) {
-        $fmt = "%s%s\n%s=\n";
-     } else {
-        $fmt = "%s%s%s=\n";
-        $fun = $first;
-     }
-     $out .= d($depth,
-               $fmt,
-               $cmd,
-               $space,
-               $fun
-              );
-     $out .= d($depth+3,"%s",ltrim(expand_function($depth+3,$second)));
-   } else {                                                # no equal sign
-     $out .= d($depth,
-               "%s%s%s",
-               $cmd,
-               $space,
-               ltrim(expand_function($depth,$first))
-              );
-   }
-   return $out;
-}
-
-#
-# fmt_default
-#   If there isn't a specalized rule to print out a segement of code,
-#   default to using this way. The general idea will probably be to just
-#   wrap() the text.
-#
-sub fmt_default
-{
-   my ($depth,$cmd,$rest) = @_;
-   my $txt = $cmd .  $rest;
-
-   if(length($txt) + $depth < 78) {          # small, don't need to touch
-      return d($depth,"%s",$txt);
-   } elsif($txt =~ /^\s*{(.*)}\s*$/) {        # handle text inside brackets
-      my $out .= d($depth) . "{" .  ltrim(expand_code($depth+1,$1)) . "\n";
-      $out .= d($depth) . "}";
-      return $out;
-   } else {                                  # free form text, just wrap it
-      my $out;
-      for my $line ( balanced_split($txt,";",3) ) { # split data at semi-colon
-         $out .= expand_function($depth+3,$line) ;
-      }
-      return d($depth,ltrim($out));
-   }
-}
-
-#
-# fmt_while
-#    Teenymush supports a @while command, format it accordingly.
-#
-#    Output Format:
-#
-#       @while ( <test condition> ) {
-#          < code >
-#       }
-#
-sub fmt_while
-{
-   my ($depth,$cmd,$rest) = @_;
+   my ($depth,$left,$function,$arguments,$right,$type) = @_;
+   my ($mleft,$mright) = (quotemeta($left),quotemeta($right));
+   my $len = length("$function.$left( ");
    my $out;
 
-   # look for while (<test condition>) { <code> };
-   if($rest =~ /^\s*\(\s*(.*?)\s*\)\s*{\s*(.*?)\s*}\s*(;{0,1})\s*$/s) {
-      $out .= d($depth,"%s","$cmd ( $1 ) {\n");
-      $out .= expand_code($depth+3,$2) . "\n";
-      $out .= d($depth,"%s","}");
-      return $out;
-   } else {                         # couldn't parse, fall back to default
-      return fmt_default(@_);
-   }
-}
+   my @array = fmt_balanced_split($arguments,",",2);
+   $function =~ s/^\s+//;                             # strip leading spaces
 
-#
-# fmt_switch
-#   Handle formating of @switch/@select.
-#
-# Output Format
-#    @select <text> =
-#       <condition1>,
-#          { <code>
-#          }
-#       <condition2>,
-#          { <code>
-#          }
-#       DEFAULT,
-#          { <code>
-#          }
-sub fmt_switch
-{
-   my ($depth,$cmd,$rest) = @_;
-   my ($out,$space);
-
-   my @list = balanced_split($rest,",",3);
-
-   my ($first,$second) = balanced_split(shift(@list),"=",4);
-   unshift(@list,$second);
-
-   $out = d($depth,"%s",$cmd);
-
-   if($first =~ /^(\s+)/) {
-      $space = $1;
-      $first = $';
-   }
-
-   my $fun = expand_function($depth + length($cmd) + length($space),$first);
-   if($fun =~ /\n/) {
-      $out .= $space . ltrim($fun) . "=\n";
-   } else {
-      $out .= $space . $first . "=\n";
-   }
-
-   for my $i (0 .. $#list) {
-      if($i == $#list) {
-         add_spaces(\$out,\@list[$i]);
-         $out .= expand_code($depth+3,@list[$i]);
-      } elsif($i % 2 == 0) {
-         add_spaces(\$out,\@list[$i]);
-         $out .= d($depth+3) . @list[$i];
-      } else {
-         add_spaces(\$out,\@list[$i]);
-         $out .= expand_code($depth+6,@list[$i]);
+   #
+   # if function is short enough, so leave it alone. However, but it unkown
+   # how much of the text to leave alone since there could be more then one
+   # function in $arguments. @array has the left over bits and what should
+   # be skipped over... the only downfall is we have to reconstruct the
+   # skipped over parts.
+   #
+   # FYI This comparison is slighytly wrong, but close
+   if($depth + length("$left$function($arguments)$right") - length(@array[0])
+      < conf("max")) {
+      if($mright ne undef) {                 # does the function end right?
+         if(@array[0] =~ /^\s*\)$mright/) {
+            @array[0] = $';                                          # yes
+         } else {
+            return (undef, undef, 1);                   # no, umatched "]"
+         }
       }
-      $out .= ",\n" if($i != $#list);
+
+      return (dprint($depth,                    # put together and return it
+                     "%s",
+                     "$left$function(" .
+                        join('',@array[1 .. $#array])
+                        . ")$right"
+                    ),
+              "@array[0]",
+              0
+             );
    }
-   return $out;
-}
 
+   $out .= dprint($depth,"%s","$left$function( " . @array[1]);
 
+   my $ident = length("$left$function( ") + $depth;
+   for my $i (2 .. $#array) {                      # show function arguments
+      $out .= noret(function_print($ident,"@array[$i]")) . "\n";
+   }
 
-#
-# fmt_amper
-#   The ampersand is used to set variables. Expand out the value
-#   of the attribute and optionally put it on a new line.
-#
-sub fmt_amper
-{
-   my ($depth,$cmd,$rest) = @_;
+   $out .= dprint($depth,"%s",")$right");                    # show ending )
 
-   my ($first,$second) = balanced_split($rest,"=",4);
-
-   if($second eq undef) {
-      return d($depth,
-               "%s%s",
-               $cmd,
-               $first
-              );
-   } elsif(length($second) > 40) {
-      return d($depth,
-               "%s%s=\n%s",
-               $cmd,
-               $first,
-               expand_function($depth+3,$second)
-              );
+   if($mright ne undef) {
+      if(@array[0] =~ /^\s*\)$mright/) {
+          return ($out,$',0);
+      } else {
+          return (undef,undef,2);
+      }
+   } elsif(@array[0] =~ /\s*\)\s*(,)/) {
+      return ($out,"$1$'",0);
    } else {
-      return d($depth,
-               "%s",
-               $cmd . $first . "=" . ltrim(expand_function($depth+3,$second))
-              );
+      return (undef,undef,3);
    }
 }
 
-
+# function_print
+#    Print out a function as is if short enough, or split it apart
+#    into multiple lines.
 #
-# fmt_dolist
-#   @dolist is used to process fixed lists of data.
-#
-# Output Example:
-#
-#    @dolist <list>=
-#    {
-#       <code>
-#    }
-sub fmt_dolist
-{
-   my ($depth,$cmd,$rest) = @_;
-   my ($ret1, $code, $ret2, $s1,$s2);
-
-   # split into list and commands
-   my ($first,$second) = balanced_split($rest,"=",4);
-
-   if($first =~ /^( +)/) {                # save leading spaces after @dolist
-      $s1 = $1;
-      $first = $';
-   }
-   if($second =~ /^( +)/) {               # save leading spaces after @dolist
-      $s2 = $1;
-      $second = $';
-   }
-   my $list = expand_function($depth+3,$first);
-
-   if($second =~ /^\s*{/) {
-      $code = expand_code($depth,$second);
-   } else {
-      $code = expand_code($depth+3,$second);
-   }
-
-   if($list =~ /\n/) {               # if list has returns, give it a new line
-      $ret1 = "\n";
-   } else {
-      $list = $first;                          # fall back to original version
-   }
-   if($code =~ /\n/) {               # if code has returns, give it a new line
-      $ret2 = "\n";
-   } else {
-      $code = $second;                         # fall back to original version
-   }
-   return d($depth,
-            "%s%s%s%s=%s%s%s",
-            $cmd,
-            $s1,
-            $ret1,
-            $list,
-            $s2,
-            $ret2,
-            $code
-           );
-}
-
-
-#
-# mywrap
-#   Text::Wrapper gets close to what we want but needs a few tweaks
-#   to get it all the way.
-#
-sub mywrap
+sub function_print
 {
    my ($depth,$txt) = @_;
+   my $out;
 
-   if(module_enabled("uri_escape")) {
-      my $wrapper = Text::Wrapper->new(columns => 78 - $depth,
-                                       body_start => d($depth+3),
-                                       wrap_after => ", ");
-      my $result = $wrapper->wrap($txt);
-      $result =~ s/\n$//;                               # remove ending return
-      return d($depth,"%s",$result);                  # indent + return results
-   } else {
-      return (" " x $depth) . $txt;
+   if($depth + length($txt) < conf("max")) {                      # too small
+      return dprint($depth,"%s",$txt);
    }
-}
 
-#
-# noswitch
-#    Remove any switches at the end of a command and return the actual
-#    command.
-#
-sub noswitch
-{
-   my $txt = shift;
-
-   if($txt =~ /^([^\/]+)/) {
-      return $1;
-   } else {
-      return $txt;
-   }
-}
-
-
-#
-# expand_args
-#    Expand the arguements of a function. This is a helper function to
-#    expand_function.
-#
-sub expand_args
-{
-   my ($level,$depth,$fun,$stack) = @_;
-   my ($type,$alternate,$d,@new,$spaces);
-
-   # add function name + ( and optional additional spacing
-   $fun .= "(";
-   my $offset = $depth + length($fun);
-
-   $type = "]" if($fun =~ /^\s*\[/);                  # add closing bracket?
-
-   $alternate = 1 if($fun =~ /switch/i);
-
-   for my $i ( 0 .. $#$stack ) {                 # expand function arguements
-      if($i == 0 || $i % 2 == 1) {
-         $d = $offset;
-      } elsif($alternate) {
-         $d = $offset + 3;
+   while($txt =~ /^(\s*)([a-zA-Z_]+)\(/s) {
+      my ($fmt,$left,$err) = function_print_segment($depth,
+                                                 '',
+                                                 $2,
+                                                 $',
+                                                 '',
+                                                 2
+                                                );
+      if($err) {
+         return $txt;
       } else {
-         $d = $offset;
+         $out .= $1 . $fmt;
+         $txt = $left;
       }
+   }
+   return $out if($out ne undef and $txt =~ /^\s*$/);
 
-      # hackery to save spaces at the begining of function arguments.
-      # and move them to the end of the previous line
-      if(@$stack[$i] =~ /^(\s+)/) {
-         (@new[$i],$spaces) = ($',$1);
-         if($i != 0) {                  # can't add spaces yet in first pos
-            @new[($i == 0) ? 0 : ($i - 1)] .= $spaces;
-            $spaces = undef;
-         }
+   @info{debug_count} = 0;
+
+   while($txt =~ /([\\]*)\[([a-zA-Z_]+)\(/s) {
+      my ($esc,$before,$after,$unmod) = ($1,$`,$',$2);
+
+      if(length($esc) % 2 == 0) {
+          my ($fmt,$left,$err) = function_print_segment($depth,
+                                                     '[',
+                                                     $unmod,
+                                                     $after,
+                                                     ']',
+                                                     1
+                                                    );
+          if($err) {
+             $out .= $before ."[$unmod(";
+             $txt = $after;
+          } else {
+             $out .= $fmt;
+             $txt = $left;
+          }
       } else {
-         @new[$i] = @$stack[$i];
+          $out .= "[$unmod(";
+          $txt = $after;
       }
-      my $fun = $spaces . ltrim(expand_function($d,@new[$i],$level+1));
-      @new[$i] = d($d,"%s",$fun);
-
-      @new[$i] .= "," if($i != $#$stack);
    }
 
-   # don't show last function arguement if empty
-   if($#new > 0 && ansi_remove(@new[$#new]) eq undef) {
-      delete @new[$#new];
-      @new[$#new] .= ",";
-   }
-
-   # put everything together and return
-   return d($depth,"%s",$fun) .
-          ltrim(join("\n",@new)) . "\n" . d($depth,")$type");
-}
-
-#
-# pending
-#    Text that look like function calls or bad function calls will break
-#    up text segments into multiple peices if sent out the door right away.
-#    Allow for joining these segments together and outputing in one segment
-#    instead of multiple.
-#
-sub pending
-{
-   my $type = shift;
-
-   if($type eq "add") {
-      my ($data,$txt) = @_;
-      $$data{txt} .= $txt;
-   } elsif($type eq "out") {
-      my ($data,$depth,$out,$txt) = @_;
-
-      if($$data{txt} ne undef) {
-         my $result = ret($out) . mywrap($depth,$$data{txt} . $txt);
-         delete $$data{txt};
-         return $result;
-      }
+   if($txt ne undef) {
+      $out =~  s/\n$//;
+      return $out . "$txt\n";
    } else {
-      die("pending: internal error, unknown '$type' type specified");
+      return $out . "$txt";
    }
+
+#   } elsif($txt =~ /^\s*\[([a-zA-Z0-9_]+)\((.*)\)(\s*)\]\s*(;{0,1})\s*$/) {
+#      $out .= function_print_segment($depth+3,'[',$1,"$2)$3$4",']',1);
+#                                                                  # function()
+#   } elsif($txt =~  /^\s*([a-zA-Z0-9_]+)\((.*)\)(\s*)(,{0,1})(\s*)$/) {
+#      $out .= function_print_segment($depth+3,'',$1,"$2)$3$4$5",'',2);
+#   } else {                                                         # no idea?
+#      $out .= dprint($depth,"%s",$txt);
+#   }
+#   return $out;
 }
 
-sub ret
+#
+# split_commmand
+#    Determine what the possible cmd and arguements are.
+#
+sub split_command
 {
-   return "\n" if(@_[0] ne undef && @_[0] !~ /\n\s*$/);
+    my $txt = shift;
+
+    if($txt =~ /^\s*&/) {
+       return ('&',$');
+    } elsif($txt =~ /^\s*([^ \/=]+)/) {
+       return ($1,$');
+    } else {
+       return $txt;
+    }
 }
 
-
-#
-# expand function
-#    Take a function or set of functions and make them more readable by
-#    indenting and spreading across multiple lines.
-#
-# Prefered Format:
-#
-#    [function( arg1,
-#               arg2,
-#               arg3
-#    )]
-#
-sub expand_function
+sub pretty
 {
-   my ($depth,$txt,$level) = @_;
-   my ($out, $space);
-   my $pend = {};
+    my ($depth,$txt) = @_;
+    my $out;
 
-   # expand most functions at least once, also but don't expand the small stuff
-   if($depth + length($txt) < 75) { # && $level > 1) {
-      return d($depth,"%s",$txt);
-   }
+    #
+    # these commands are handled differently then other commands.
+    #
+    my %fmt_cmd = (
+        '@switch' => sub { fmt_switch(@_); },
+        '@select' => sub { fmt_switch(@_); },
+        '@dolist' => sub { fmt_dolist(@_); },
+        '&'       => sub { fmt_amper(@_);  },
+        '@while'  => sub { fmt_while(@_);  },
+    );
 
-   # unbracketed single function
-   if($txt =~ /^\s*([a-zA-Z\_\!]+)\((.*)\)\s*$/) {
-      my ($fun,$rest) = ($1,"$2)");
-      my ($remainder,@stack) = balanced_split($rest,",",2);
+    if($depth + length($txt) < conf("max")) {
+        return (" " x $depth) . $txt;
+    }
 
-      if(ansi_remove($remainder) =~ /^\s*$/) {
-         return expand_args($level,$depth,$fun,\@stack);
-      }
-      return d($depth,"%s",$txt);                               # parse error
-   }
-
-   # process function by function
-   while($txt =~ /\[([a-zA-Z\_\!]+)\(/) {               # possible function
-      my ($fun,$before,$rest) = ($1,$`,$');
-
-      # balance_split will split up args & find end of function
-      my ($remainder,@stack) = balanced_split($rest,",",2);
-
-      # throw any text found before the function into pending
-      pending("add",$pend,$before,$out) if($before !~ /^\s*$/);
-
-      # determine success by checking remainder
-      if($remainder =~ /](\s*)/) {
-         ($txt,$space) = ($',$1);
-
-         if(ansi_remove($`) !~ /^\s*$/) {      # parse error / treat like text
-            pending("add",$pend,"[$fun(");
-            $txt = $rest;
-         } else {                                           # valid function?
-            my $res = expand_args($level,$depth,"[$fun",\@stack) .
-                      $space;
-
-            # don't expand single line and/or shorter functions
-            $out .= ret($out);
-            $out .= pending("out",$pend,$depth,$out);
-
-            if($res !~ /\n/ || length($res) < 70) {    # funct small no expand
-               $out .= ret($out) .
-                       d($depth,"[$fun(" . join(",",@stack) . ")]$space");
-            } else {                                     # add expanded output
-               $out .= ret($out) . $res;
-            }
-         }
-      } else {                                # parse error / treat like text
-         pending("add",$pend,"[$fun(",$out);
-         $txt = $rest;
-      }
-   }
-
-   if($txt ne undef || defined $$pend{txt}) {
-      $out .= ret($out,$pend,$txt);
-   }
-   pending("add",$pend,$txt);
-   $out .= pending("out",$pend,$depth);
-
-   return $out;
-#   return "<1>" . ret($out) . "<2>" . $out;
-}
+    for my $txt ( fmt_balanced_split($txt,';',3,1) ) {
+       my ($cmd,$arg) = split_command($txt);
+       if(defined @fmt_cmd{$cmd}) {
+          $out =~ s/\s+$//g;
+          $out .= "\n" if $out ne undef;
+          $out .= &{@fmt_cmd{$cmd}}($depth,$cmd,$arg);
+          $out =~ s/\n+$//g if($depth==3);
+       } elsif(defined @fmt_cmd{lc($cmd)}) {
+          $out .= &{@fmt_cmd{lc($cmd)}}($depth,$cmd,$arg);
+          $out =~ s/\n+$//g if($depth==3);
+       } else {
+          $out .= dprint($depth,"%s",$txt);
+       }
+    }
 
 
-#
-# add_spaces
-#   Spaces are never significant at the begining of a line. This function
-#   will slurp up spaces from the begining of a line and move them to the
-#   end of the previous line. More then likely these spaces could be
-#   dropped but it makes diffing the output easier and helps prove that
-#   the code is not deleting things it shouldn't.
-sub add_spaces
-{
-   my ($out,$str) = @_;
-
-   if(ref($str) eq "SCALAR") {          # reference to input string passed in
-      if($$str =~ /^(\s+)/) {
-         $$str = $';                                  # fix up current string
-         $$out = noret($$out) . $1 . "\n";                    # fix up output
-      }
-   } elsif($str =~ /^(\s+)/) {
-      # actual string passed in, any changes would be lost and probably can't
-      # be done anyways... so just modify the output which needs to always
-      # be a reference to the string.
-      $$out = noret($$out) . $1 . "\n";
-   }
+    if($depth == 0) {
+       return noret($out);
+    } else {
+       return $out;
+    }
 }
 
 #
-# expand_code
-#   Take the contents of an attribute and add spaces, returns, etc so
-#   the code within is more readable.
+# test code for use outside the mush
 #
-sub expand_code
-{
-   my ($depth,$input,$indent) = @_;
-   my ($out, $count);
+# my $code = '@select 0=[not(eq(words(first(v(won))),1))],{@pemit %#=Connect 4: Game over, [name(first(v(won)))] has won.},[match(v(who),%#|*)],{@pemit %#=Connect 4: Sorry, Your not playing right now.},[match(first(v(who)),%#|*)],{@pemit %#=Connect 4: Sorry, its [name(before(first(v(who)),|))] turn right now.},[and(isnum(%0),gt(%0,0),lt(%0,9))],{@pemit %#=Connect 4: That is not a valid move, try again.},[not(gte(strlen(v(c[first(%0)])),8))],{@pemit %#=Connect 4: Sorry, that column is filled to the max.},{&who me=[rest(v(who))] [first(v(who))];&won me=[switch(1,u(fnd,%0,add(1,strlen(v(c[first(%0)]))),after(rest(v(who)),|)),%#)];&c[first(%0)] me=[v(c[first(%0)])][after(rest(v(who)),|)];@pemit %#=[u(board,{%n played in column [first(%0)]})];@pemit [before(first(v(who)),|)]=[u(board,{%n played in column [first(%0)]})];@switch [web()]=0,@websocket connect}';
+# my $code = '@select 0=[member(type(num(%1)),PLAYER)],@pemit %#=Connect 4: Sorry I dont see that person here.,{&won me=;&who me=%#|# [num(%1)]|O;"%N has challenged [name(num(%1))].;&c1 me=;&c2 me=;&c3 me=;&c4 me=;&c5 me=;&c6 me=;&c7 me=;&c8 me=;@pemit %#=[u(board)];@pemit [num(%1)]=[u(board)]}';
+#
+# my $code='&list me=[u(fnd,%0,%1,after(first(v(who)),|))];@select 0=[match(v(who),%#|*)],{@pemit %#=Tao: Sorry, Your not playing right now.},[match(first(v(who)),%#|*)],{@pemit %#=Tao: Sorry, its [name(before(first(v(who)),|))] turn right now.},[u(isval,%0,%1,.)],{@pemit %#=Tao: That is not a valid move, try again.},[words(v(list))],{@pemit %#=Tao: Sorry, that move does not result in a capture.},{&who me=[rest(v(who))] [first(v(who))];@dolist [first(%0)]|[first(%1)] [v(list)] END=@select ##=END,{@pemit %#=[u(board,{%n played [first(%0)],[first(%1)]})];@pemit [before(first(v(who)),|)]=[u(board,{%n played [first(%0)],[first(%1)]})]},{&c[before(##,|)] me=[replace(v(c[before(##,|)]),after(##,|),after(rest(v(who)),|),|)]}}';
+# my $code='[setq(0,iter(u(num,3),[u(ck,2,%2,add(%0,##),add(%1,##))][u(ck,3,%2,add(%0,##),%1)][u(ck,4,%2,add(%0,##),add(%1,-##))][u(ck,5,%2,%0,add(%1,-##))][u(ck,6,%2,add(%0,-##),add(%1,-##))][u(ck,7,%2,add(%0,-##),%1)][u(ck,8,%2,add(%0,-##),add(%1,##))]))]';
+# my $code='@switch [t(match(get(#5/hangout_list),%1))][match(bus cab bike motorcycle car walk boomtube,%0)]=0*,@pemit %#=Double-check the DB Number. That does not seem to be a viable option.,11,{@tel %#=%1;@wait 1=@remit [loc(%#)]=A bus pulls up to the local stop. %N steps out.},12,{@tel %#=%1;@wait 1=@remit [loc(%#)]=A big yellow taxi arrives. A figure inside pays the tab%, then steps out and is revealed to be %N.},13,{@tel %#=%1;@wait 1=@remit [loc(%#)]=%N arrives in the area%, pedaling %p bicycle.},14,{@tel %#=%1;@wait 1=@remit [loc(%#)]=%N pulls up on %p motorcycle%, kicking the stand and stepping off.},15,{@tel %#=%1;@wait 1=@remit [loc(%#)]=%N pulls up in %p car%, parking and then getting out.},16,{@tel %#=%1;@wait 1=@remit %N walks down the street in this direction.=<an emit>},17,{@tel %#=%1;@wait 1=@remit [loc(%#)]=A boomtube opens%, creating a spiraling rift in the air. After a moment%, %N steps out.},@pemit %#=That method of travel does not seem to exist.';
+#my $code ='&won me=[switch(1,u(fnd,%0,add(1,strlen(v(c[first(%0)]))),after(rest(v(who)),|)),%#)]';
+#my $code = '[setq(1,)][setq(2,)][setq(3,)][setq(4,)][setq(5,)][setq(6,)][setq(7,)][setq(8,)][setq(9,)][setq(0,)]';
+# my $code = '@switch 0=run(@telnet wttr.in 80),say Weather is temporarly unavailible.,{  @var listen=off;@send GET /@%1?0?T HTTP/1.1;@send Host: wttr.in;@send Connection: close;@send User-Agent: curl/7.52.1;@send Accept: */*;@send ;@while ( telnet_open(%{input}) eq 1 ) {@var input = [input()];@switch on-done-%{input}=on-%{listen}-*,@@ ignore,on-done-*out of queries*,{say Weather Website is down [out of queries];@var listen=done},on-done-ERROR*,{say Unknown Location: %1;@var listen=done},on-done-#-1 *,@@ ignore,on-done-Weather report:*,{@var listen=on;@emit %{input}},%{listen}-done-,@@ ignore,%{listen}-done-*,@emit > [decode_entities(%{input})]}';
 
-   my %fmt_cmd = (
-      '@switch'  => sub { fmt_switch(@_);   },
-      '@select'  => sub { fmt_switch(@_);   },
-      '@dolist'  => sub { fmt_dolist(@_);   },
-      '&'        => sub { fmt_amper(@_);    },
-      '@while'   => sub { fmt_while(@_);    },
-      'think'    => sub { fmt_default(@_);  },
-      '@pemit'   => sub { fmt_equal(@_);    },
-      '@wait'    => sub { fmt_equal(@_);    },
-      '@edit'    => sub { fmt_equal(@_);    },
-   );
+#
+#
+# printf("%s\n",pretty(3,$code));
+# printf("%s\n",function_print(3,$code));
 
-   if($input =~ /^(\s*){(\s*)(.*?)}(\s*)$/) {              # handle code in {}s
-      $out .= d($depth,"{$2") . "\n";
-      $out .= expand_code($depth+3,$3,$indent);
-      $out .= ret($out) . d($depth,"}");
-      return $out;
-   }
-#   printf("\n\n");
-   for my $txt ( balanced_split($input,";",3) ) {  # split data at semi-colon
-#      printf("# '%s'\n",$txt);
-#      next;
-      ++$count;
-      $depth = 3 if($indent && $count == 2 && $depth == 0);
-      if($out ne undef) {                     # delims are eaten, add it back
-         $out .= ";" if $out ne undef;
-         $out .= "\n" if $txt !~ /^\s*$/;
-      }
-      if($txt =~ /^(\s*)([&"`:;\\])/ ||            # match single char cmd
-         $txt =~ /^(\s*)([^ \\]+)/) {                 # match word command
-
-         add_spaces(\$out,$1);
-         if(defined @fmt_cmd{lc(noswitch($2))}) {    # specially formated cmd?
-            $out .= &{@fmt_cmd{lc(noswitch($2))}}($depth,$2,$');
-         } else {                                  # use default formating
-            $out .= fmt_default($depth,$2,$');
-         }
-      }
-   }
-   return $out;
-}
-
-# ----[ mec end ]--------------------------------------------------------- #
-
+#
+# define which function's arguements should not be evaluated before
+# executing the function. The sub-hash defines exactly which argument
+# should be not evaluated ( starts at 1 not 0 )
+#
+#my %exclude =
+#(
+#   iter      => { 2 => 1 },
+#   parse     => { 2 => 1 },
+#   setq      => { 2 => 1 },
+#   switch    => { all => 1 },
+##   u         => { 2 => 1, 3 => 1, 4 => 1, 5 => 1, 6 => 1, 7 => 1, 8 => 1,
+##                  9 => 1, 10 => 1 },
+#);
 
 sub initialize_functions
 {
@@ -11037,7 +10368,6 @@ sub initialize_functions
    @fun{substr}     = sub { return &fun_substr(@_);                };
    @fun{mul}        = sub { return &fun_mul(@_);                   };
    @fun{file}       = sub { return &fun_file(@_);                  };
-   @fun{write}      = sub { return &fun_write(@_);                  };
    @fun{space}      = sub { return &fun_space(@_);                 };
    @fun{repeat}     = sub { return &fun_repeat(@_);                };
    @fun{time}       = sub { return &fun_time(@_);                  };
@@ -11188,10 +10518,6 @@ sub initialize_functions
    @fun{isdbref}    = sub { return &fun_isdbref(@_);               };
    @fun{secure}     = sub { return &fun_secure(@_);                };
    @fun{uri_escape} = sub { return &fun_uri_escape(@_);            };
-   @fun{isupper}    = sub { return &fun_isupper(@_);               };
-   @fun{lord}       = sub { return &fun_lord(@_);               };
-   @fun{islower}    = sub { return &fun_islower(@_);               };
-   @fun{shuffle}    = sub { return &fun_shuffle(@_);               };
 }
 
 
@@ -11316,28 +10642,6 @@ sub crypt_code
 }
 
 
-sub fun_isupper
-{
-   my ($self,$prog,$txt) = (obj(shift),shift,shift);
-
-   return show($prog);
-   return (evaluate($self,$prog,$txt) =~ /[a-z]/) ? 0 : 1;
-}
-
-sub fun_lord
-{
-   my ($self,$prog,$txt) = (obj(shift),shift,shift);
-
-   return lord(evaluate($self,$prog,$txt));
-}
-
-sub fun_islower
-{
-   my ($self,$prog,$txt) = (obj(shift),shift,shift);
-
-   return (evaluate($self,$prog,$txt) =~ /[A-Z]/) ? 0 : 1;
-}
-
 sub fun_uri_escape
 {
    my ($self,$prog) = (obj(shift),shift);
@@ -11356,7 +10660,7 @@ sub fun_haspower
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,2) ||
+   good_args($#_,2) ||
      return "#-1 FUNCTION (POWER) EXPECTS 2 ARGUMENTS";
 
    return 0;
@@ -11392,7 +10696,7 @@ sub fun_create
 
    if($type eq "r") {
 
-      good_args(\@_,0,1,2) ||
+      good_args($#_,0,1,2) ||
         return "#-1 FUNCTION (CREATE) EXPECTS 2 TO 4 ARGUMENTS FOR 'R' TYPE";
       my $in = ansi_substr(trim(evaluate($self,$prog,shift)),0,399);
       my $out = ansi_substr(trim(evaluate($self,$prog,shift)),0,399);
@@ -11400,7 +10704,7 @@ sub fun_create
 
    } elsif($type eq "e") {                                              # exit
 
-      good_args(\@_,0,1) ||
+      good_args($#_,0,1) ||
         return "#-1 FUNCTION (CREATE) EXPECTS 1 OR 2 ARGUMENTS FOR 'E' TYPE";
 
       my $name = ansi_substr(trim(evaluate($self,$prog,shift)),0,399);
@@ -11423,7 +10727,7 @@ sub fun_create
          return "#-1 INVALID CREATION AMOUNT";
       }
       
-      good_args(\@_,0,1) ||
+      good_args($#_,0,1) ||
         return "#-1 FUNCTION (CREATE) EXPECTS 2 OR 3 ARGUMENTS FOR 'T' TYPE";
       $result = create_thing($self,$prog,$name,$value);
    }
@@ -11435,7 +10739,7 @@ sub fun_create
       return "#-1 $result";
    }
    
-#   good_args(\@_,2) ||
+#   good_args($#_,2) ||
 #     return "#-1 FUNCTION (ZONE) EXPECTS 2 ARGUMENTS";
 
 #    if(hasflag($self,"GUEST")) {
@@ -11457,10 +10761,10 @@ sub fun_create
 #       return err($self,$prog,"Unable to deduct cost of object.");
 #    }
 # 
-#    echo(self   => $self,
-#         prog   => $prog,
-#         source => [ "Object created as: %s",obj_name($self,$dbref) ],
-#        );
+#    necho(self   => $self,
+#          prog   => $prog,
+#          source => [ "Object created as: %s",obj_name($self,$dbref) ],
+#         );
 # 
 #    set_quota($self,"sub");
 }
@@ -11473,7 +10777,7 @@ sub fun_mush_address
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,0) ||
+   good_args($#_,0) ||
      return "#-1 FUNCTION (MUSH_ADDRESS) EXPECTS NO ARGUMENTS";
 
    if(!module_enabled("dns")) {
@@ -11504,7 +10808,7 @@ sub fun_quota
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
      return "#-1 FUNCTION (QUOTA) EXPECTS 1 ARGUMENTS";
 
    my $target = find($self,$prog,evaluate($self,$prog,shift)) ||
@@ -11523,7 +10827,7 @@ sub fun_zone
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
      return "#-1 FUNCTION (ENCRYPT) EXPECTS 1 ARGUMENT";
 
    return 0;
@@ -11533,7 +10837,7 @@ sub fun_starttime
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,0) ||
+   good_args($#_,0) ||
      return "#-1 FUNCTION (STARTTIME) EXPECTS 0 ARGUMENTS";
 
    return scalar localtime(@info{server_start});
@@ -11543,7 +10847,7 @@ sub fun_encrypt
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,2) ||
+   good_args($#_,2) ||
      return "#-1 FUNCTION (ENCRYPT) EXPECTS 2 ARGUMENTS";
 
    my $text = evaluate($self,$prog,shift);
@@ -11556,7 +10860,7 @@ sub fun_decrypt
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,2) ||
+   good_args($#_,2) ||
      return "#-1 FUNCTION (DECRYPT) EXPECTS 2 ARGUMENTS";
 
    my $text = evaluate($self,$prog,shift);
@@ -11577,7 +10881,7 @@ sub fun_power
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,2) ||
+   good_args($#_,2) ||
      return "#-1 FUNCTION (POWER) EXPECTS 2 ARGUMENTS";
 
    my $num = evaluate($self,$prog,shift);
@@ -11604,7 +10908,7 @@ sub fun_info
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
      return "#-1 FUNCTION (INFO) EXPECTS 1 ARGUMENT";
 
    my $var = evaluate($self,$prog,shift);
@@ -11629,7 +10933,7 @@ sub fun_password
 
    hasflag($self,"WIZARD") ||
      hasflag($self,"GOD") ||
-     owner_id($$self{obj_id}) eq conf("webuser") ||
+     $$self{obj_id} eq conf("webuser") ||
      return "#-1 PERMISSION DENIED";
 
    my $target = find($self,$prog,evaluate($self,$prog,shift)) ||
@@ -11646,7 +10950,7 @@ sub fun_lvariable
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,0,1) ||
+   good_args($#_,0,1) ||
      return "#-1 FUNCTION (LVARIABLE) EXPECTS 0 OR 1 ARGUMENTS";
 
    if(!defined $$prog{var}) {
@@ -11758,6 +11062,7 @@ sub fun_ansi2mush
    );
 
    my $txt = evaluate($self,$prog,shift);
+#   printf("TXT: '%s'\n",ansi_remove($txt));
    $txt =~ s/\r//g;
 #   $txt =~ s/ /%b/g;
    my $str = ansi_init($txt);
@@ -11917,7 +11222,7 @@ sub fun_tohex
 {
    my($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
      return "#-1 FUNCTION (TOHEX) EXPECTS 1 ARGUMENTS";
 
    my $txt = evaluate($self,$prog,shift);
@@ -11930,7 +11235,7 @@ sub fun_colors
    my($self,$prog) = (obj(shift),shift);
    my @result;
 
-   good_args(\@_,1,2) ||
+   good_args($#_,1,2) ||
      return "#-1 FUNCTION (COLORS) EXPECTS 1 OR 2 ARGUMENTS";
 
    my $txt = trim(evaluate($self,$prog,shift));
@@ -11972,7 +11277,7 @@ sub fun_ldelete
    my($self,$prog) = (obj(shift),shift);
    my (@delete, @result);
 
-   good_args(\@_,2,3,4) ||
+   good_args($#_,2,3,4) ||
      return "#-1 FUNCTION (LDELETE) EXPECTS BETWEEN 2 AND 4 ARGUMENTS";
 
    my $txt       = evaluate($self,$prog,shift);
@@ -12002,7 +11307,7 @@ sub fun_ansi_debug
 {
    my($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
      return "#-1 FUNCTION (FOREACH) EXPECTS 1 ARGUMENT";
 
    return ansi_debug(evaluate($self,$prog,shift));
@@ -12017,10 +11322,9 @@ sub fun_foreach
    my($self,$prog) = (obj(shift),shift);
    my ($out,$left,$tmp);
 
-   good_args(\@_,2,4) ||
+   good_args($#_,2,4) ||
      return "#-1 FUNCTION (FOREACH) EXPECTS 2 OR 4 ARGUMENTS";
 
-#   printf("Fe: '%s'\n",$_[0]);
    my $atr = atr_get($self,$prog,shift);                  # no attr/ no error
    return "#-1 no attr" if($atr eq undef);                 # emulate mux/mush
 
@@ -12059,7 +11363,7 @@ sub fun_pack
 {
    my($self,$prog,$n,$b) = (obj(shift),shift);
 
-   good_args(\@_,1,2,3) ||
+   good_args($#_,1,2,3) ||
      return "#-1 FUNCTION (PACK) EXPECTS 1, 2, or 3 ARGUMENTS - $#_";
 
    my $n = evaluate($self,$prog,shift);
@@ -12079,7 +11383,7 @@ sub fun_unpack
 {
    my($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,1,2,3) ||
+   good_args($#_,1,2,3) ||
      return "#-1 FUNCTION (PACK) EXPECTS 1, 2, or 3 ARGUMENTS - $#_";
 
    my $n = evaluate($self,$prog,shift);
@@ -12097,7 +11401,7 @@ sub fun_pickrand
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,1,2) ||
+   good_args($#_,1,2) ||
      return "#-1 FUNCTION (PICKRAND) EXPECTS 1 OR 2 ARGUMENTS";
 
    my $txt = evaluate($self,$prog,shift);
@@ -12109,22 +11413,6 @@ sub fun_pickrand
    return $$list[int(rand($#$list+1))];
 }
 
-sub fun_shuffle
-{
-   my ($self,$prog) = (obj(shift),shift);
-
-   good_args(\@_,1,2) ||
-     return "#-1 FUNCTION (PICKRAND) EXPECTS 1 OR 2 ARGUMENTS";
-
-   my $txt = evaluate($self,$prog,shift);
-   my $delim = evaluate($self,$prog,shift);
-   $delim =  " " if($delim eq undef);
-
-   my $list = [ shuffle(safe_split($txt,$delim)) ];
-
-   return join($delim,@$list);
-}
-
 #
 # fun_if
 #
@@ -12132,7 +11420,7 @@ sub fun_if
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,2,3) ||
+   good_args($#_,2,3) ||
       return "#-1 FUNCTION (IF/IF_ELSE) EXPECTS 2 OR 3 ARGUMENTS";
 
    my $exp = evaluate($self,$prog,shift);
@@ -12148,7 +11436,7 @@ sub fun_round
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,1,2) ||
+   good_args($#_,1,2) ||
       return "#-1 FUNCTION (HTML_STRIP) EXPECTS 1 OR 2 ARGUMENTS";
 
    my $num = evaluate($self,$prog,shift);
@@ -12166,7 +11454,7 @@ sub fun_html_strip
 
    return "#-1 Not enabled" if(!module_enabled("html_restrict"));
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
       return "#-1 FUNCTION (HTML_STRIP) EXPECTS 1 ARGUMENTS";
 
    my $hr = HTML::Restrict->new();
@@ -12218,7 +11506,7 @@ sub fun_trim
    my ($self,$prog) = (obj(shift),shift);
    my ($start,$end,%filter);
 
-   good_args(\@_,1,2,3) ||
+   good_args($#_,1,2,3) ||
       return "#-1 FUNCTION (TRIM) EXPECTS 1, 2, OR 3 ARGUMENTS";
 
    my $return = chr(13);
@@ -12304,7 +11592,7 @@ sub fun_mod
 {
    my ($self,$prog,$txt) = (obj(shift),shift);
 
-   good_args(\@_,2) ||
+   good_args($#_,2) ||
       return "#-1 FUNCTION (MOD) EXPECTS 2 ARGUMENTS";
 
    my $one = ansi_remove(evaluate($self,$prog,shift));
@@ -12402,7 +11690,7 @@ sub fun_ansi_remove
    my ($self,$prog,$txt) = (obj(shift),shift);
 
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
       return "#-1 FUNCTION (ANSI_REMOVE) EXPECTS 1 ARGUMENT";
    return ansi_remove(evaluate($self,$prog,shift));
 }
@@ -12412,7 +11700,7 @@ sub fun_ansi
    my ($self,$prog) = (obj(shift),shift);
    my $out;
 
-   good_args(\@_,2) ||
+   good_args($#_,2) ||
       return "#-1 FUNCTION (ANSI) EXPECTS 2 ARGUMENTS";
 
    my $code = evaluate($self,$prog,shift);
@@ -12441,7 +11729,7 @@ sub fun_set
 {
    my ($self,$prog,$value) = (obj(shift),shift);
 
-   good_args(\@_,2) ||
+   good_args($#_,2) ||
       return "#-1 FUNCTION (SET) EXPECTS 2 ARGUMENTS";
 
    my ($obj,$attr,$delim) = balanced_split(shift,"/",4);
@@ -12498,7 +11786,7 @@ sub fun_setunion
    my %list;
 
    #--- [ handle arguments ]---------------------------------------------#
-   good_args(\@_,2 .. 5) ||
+   good_args($#_,2 .. 5) ||
       return "#-1 FUNCTION (SETUNION) EXPECTS 2 to 5 ARGUMENTS";
 
    my $list1 = evaluate($self,$prog,shift);
@@ -12537,7 +11825,7 @@ sub fun_listinter
    my (%l1, %l2, @result,$count);
 
    #--- [ handle arguments ]---------------------------------------------#
-   good_args(\@_,2 .. 5) ||
+   good_args($#_,2 .. 5) ||
       return "#-1 FUNCTION (SETUNION) EXPECTS 2 to 5 ARGUMENTS";
 
    my $list1 = evaluate($self,$prog,shift);
@@ -12577,7 +11865,7 @@ sub fun_setdiff
    my (%list, %result);
 
    #--- [ handle arguments ]---------------------------------------------#
-   good_args(\@_,2 .. 5) ||
+   good_args($#_,2 .. 5) ||
       return "#-1 FUNCTION (SETUNION) EXPECTS 2 to 5 ARGUMENTS";
 
    my $list1 = evaluate($self,$prog,shift);
@@ -12618,7 +11906,7 @@ sub fun_entities
 
    return "#-1 FUNCTION (ENTITIES) NOT ENABLED" if(!module_enabled("entities"));
 
-   good_args(\@_,2) ||
+   good_args($#_,2) ||
       return "#-1 FUNCTION (ENTITIES) EXPECTS 2 ARGUMENTS";
 
    my $txt = evaluate($self,$prog,shift);
@@ -12631,39 +11919,6 @@ sub fun_entities
       return decode_entities(evaluate($self,$prog,shift));
    }
 }
-
-#
-# webobject
-#   Is the object part of the http webobject?
-#
-sub webobject
-{
-   my $obj = shift;
-
-   if(owner_id($obj) eq owner_id(conf("webobject"))) {
-      return 1;
-   } else {
-      return 0;
-   }
-}
-
-#
-# good_filename
-#   Determine which files may be opened in the files directory and
-#   which ones shouldn't.
-#
-sub good_filename
-{
-   my $fn = shift;
-
-   # Any file starting with a period or having a \/ will be denied.
-   # this *should* prevent escaping out of the files folder.
-   if($fn =~ /^\.|\/|\\/ || !-e "files/$fn") {
-      return 0;
-   } else {
-      return 1;
-   }
-}
 #
 # fun_file
 #     Return the contents of a file
@@ -12671,82 +11926,30 @@ sub good_filename
 sub fun_file
 {
    my ($self,$prog) = (obj(shift),shift);
-   my $file;
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
       return "#-1 FUNCTION (FILE) EXPECTS 1 ARGUMENT";
-
-   hasflag($self,"WIZARD") || webobject($self) ||
-      return set_var($prog,"data","#-1 PERMISSION DENIED");
-
-   @info{cache} = {} if(!defined @info{cache});
-   for my $key (keys %{@info{cache}}) {             # cache data for 3 days
-      if(time() - @info{cache}->{$key}->{last} > 259200) {
-         delete @info{cache}->{$key};
-      }
-   }
 
    my $fn = evaluate($self,$prog,shift);
 
-   good_filename($fn) || return "#-1 PERMISSION DENIED";
+   if($fn !~ /\.(txt|pl|js)$/i) {
+      return "#-1 UNKNOWN FILE";
+   } else {
+      my $file = getfile($fn);
 
-   @info{cache} = {} if !defined @info{cache};
-   @info{cache}->{$fn} = {} if !defined @info{cache}->{$fn};
-
-   my $data = @info{cache}->{$fn};
-   my $mod = (stat("files/$fn"))[9];
-
-   if(!defined $$data{mod} || $$data{mod} != $mod) {
-      if(!open($file,"files/$fn")) {
-         delete @info{cache}->{$fn};
-         return undef;
+      if($file eq undef) {
+         return "#-1 UNKNOWN FILE";
+      } else {
+         return $file;
       }
-
-      {
-         local $/;
-         $$data{data} = <$file>;                      # read file;
-      };
-
-      close($file);
-      $$data{mod} = $mod;
    }
-
-   $$data{last} = time();
-   return $$data{data};
-}
-
-#
-# fun_write
-#   Writ
-sub fun_write
-{
-   my ($self,$prog,$fn,$data,$mode) = (obj(shift),shift,shift,shift,shift);
-   my $file;
-
-   if(!hasflag($self,"GOD")) {
-      return "#-1 PERMISSION DENIED.";
-   } elsif(uc($mode) ne "WRITE"  && uc($mode) ne "W" &&
-           uc($mode) ne "APPEND" && uc($mode) ne "A" && $mode ne undef) {
-      return "#-1 INVALID MODE: EXPECTED APPEND[A], WRITE[W], OR NOTHING";
-   } elsif($fn =~ /[\/\\]/) {
-      return "#-1 FILENAME SHALL NOT CONTAIN \/ OR \\";
-   } elsif($fn =~ /^\s*\./) {
-      return "#-1 FILENAME SHALL NOT START WITH A PERIOD";
-   } elsif(lc($mode) eq "WRITE" || lc($mode) eq "W" || $mode eq undef) {
-      open($file,"> files/$fn") || return "#-1 UNABLE TO OPEN FILE 'txt/$fn'";
-   } elsif(lc($mode) eq "APPEND" || lc($mode) eq "A") {
-      open($file,"> files/$fn") || return "#-1 UNABLE TO OPEN FILE";
-   }
-
-   printf($file "%s",evaluate($self,$prog,$data));
-   close($file);
 }
 
 sub fun_ip
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
       return "#-1 FUNCTION (IP) EXPECTS 1 ARGUMENT";
 
    my $target = find_player($self,$prog,evaluate($self,$prog,shift)) ||
@@ -12775,7 +11978,7 @@ sub fun_money
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
       return "#-1 FUNCTION (MONEY) EXPECTS 1 ARGUMENT";
 
    my $target = find($self,$prog,evaluate($self,$prog,shift)) ||
@@ -12792,7 +11995,7 @@ sub fun_lflags
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
       return "#-1 FUNCTION (URL) EXPECTS 1 ARGUMENT";
 
    my $target = find($self,$prog,evaluate($self,$prog,shift)) ||
@@ -12813,7 +12016,7 @@ sub fun_url
    my ($self,$prog) = (obj(shift),shift);
    my ($host,$path,$sock,$secure);
 
-   good_args(\@_,1,2) ||
+   good_args($#_,1,2) ||
      return set_var($prog,"data","#-1 FUNCTION (URL) EXPECTS 1 OR 2 ARGUMENTS");
 
    hasflag($self,"SOCKET_INPUT") ||
@@ -12847,7 +12050,6 @@ sub fun_url
       if($#$buff >= 0) {
          my $data = shift(@$buff);
 
-#         printf("# %s\n",$data);
 # wttr.in debug
 #         if($data =~ /\d mi/)  {
 #            printf("%s -> %s\n",lord($`));
@@ -12861,18 +12063,14 @@ sub fun_url
          set_var($prog,"data","#-1 DATA PENDING");
          return 1;
       } elsif(defined $$prog{socket_closed}) {
-         $$prog{socket_closed} = 1;
-         $$prog{socket_buffer} = [ "#-1 CONNECTION CLOSED" ];
-         return set_var($prog,"data","#-1 CONNECTION CLOSED");
+         set_var($prog,"data","#-1 CONNECTION CLOSED");
+         return 0;
       }
    } else {                                                # new connection
       delete @info{socket_buffer};                    # last request buffer
 
       if($secure) {                                      # open connection
-         # ssl_verify_mode should probably not be turned off but this is
-         # mushcode and i'd rather have it work then fail because a site
-         # didn't setup their certs.
-         $sock = Net::HTTPS::NB->new(Host => $host, SSL_verify_mode => undef);
+         $sock = Net::HTTPS::NB->new(Host => $host);
       } else {
          $sock = Net::HTTP::NB->new(Host => $host);
       }
@@ -12897,7 +12095,6 @@ sub fun_url
       # make request as curl (helps with wttr.in)
       $path =~ s/ /%20/g;
       set_var($prog,"url",$path);
-#      printf("PATH: '%s'\n",$path);
 
       eval {                        # protect against uncontrollable problems
          if($#_ == 1) {
@@ -13085,7 +12282,7 @@ sub fun_chr
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
      return "#-1 FUNCTION (CONTROLS) EXPECTS 1 ARGUMENT";
 
    my $num = evaluate($self,$prog,shift);
@@ -13109,7 +12306,7 @@ sub fun_controls
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,1,2) ||
+   good_args($#_,1,2) ||
      return "#-1 FUNCTION (CONTROLS) EXPECTS 2 ARGUMENTS";
 
    my $obj = find($self,$prog,evaluate($self,$prog,shift)) ||
@@ -13149,7 +12346,7 @@ sub fun_convsecs
 {
     my ($self,$prog) = (shift,shift);
 
-    good_args(\@_,1) ||
+    good_args($#_,1) ||
        return "#-1 FUNCTION (CONVSECS) EXPECTS 1 ARGUMENT";
 
     my $txt = evaluate($self,$prog,shift);
@@ -13172,7 +12369,7 @@ sub fun_convtime
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
       return "#-1 FUNCTION (CONVTIME) EXPECTS 1 ARGUMENTS";
 
   return fuzzy(evaluate($self,$prog,shift));
@@ -13182,7 +12379,7 @@ sub fun_find
 {
     my ($self,$prog) = (shift,shift);
 
-    good_args(\@_,1) ||
+    good_args($#_,1) ||
        return "#-1 FUNCTION (CONVSECS) EXPECTS 1 ARGUMENT";
 
     my $obj = find($self,$prog,evaluate($self,$prog,shift));
@@ -13199,7 +12396,7 @@ sub fun_min
    my ($self,$prog,$txt) = (obj(shift),shift);
    my $min;
 
-   good_args(\@_,1 .. 100) ||
+   good_args($#_,1 .. 100) ||
      return "#-1 FUNCTION (MIN) EXPECTS 1 AND 100 ARGUMENTS";
 
    while($#_ >= 0) {
@@ -13219,7 +12416,7 @@ sub fun_fold
    my ($self,$prog,$txt) = (obj(shift),shift);
    my ($count,$atr,$last,$zero,$one);
 
-   good_args(\@_,2,3,4) ||
+   good_args($#_,2,3,4) ||
      return "#-1 FUNCTION (FOLD) EXPECTS 2 TO 3 ARGUMENTS";
 
    my $atr = evaluate($self,$prog,shift);
@@ -13262,7 +12459,7 @@ sub fun_idle
    my ($self,$prog,$txt) = (obj(shift),shift);
    my $idle;
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
      return "#-1 FUNCTION (IDLE) EXPECTS 1 ARGUMENT";
 
    my $name = evaluate($self,$prog,shift);
@@ -13294,7 +12491,7 @@ sub fun_conn
    my ($self,$prog,$txt) = (obj(shift),shift);
    my ($result,$target,$port) = (-1);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
      return "#-1 FUNCTION (CONN) EXPECTS 1 ARGUMENT";
 
    my $lookfor = evaluate($self,$prog,shift);
@@ -13356,7 +12553,7 @@ sub fun_base64
       return "#-1 FUNCTION DISABLED (MIME MODULE DISABLED)";
    }
 
-   good_args(\@_,2) ||
+   good_args($#_,2) ||
      return "#-1 FUNCTION (BASE64) EXPECTS 2 ARGUMENT ($#_)";
 
    my $type = ansi_remove(evaluate($self,$prog,shift));
@@ -13384,10 +12581,10 @@ sub fun_compress
    }
 
    hasflag($self,"WIZARD") ||
-     owner_id($$self{obj_id}) eq conf("webuser") ||
-     return "#-1 FUNCTION (COMPRESS) EXPECTS WIZARD FLAG OR IS WEBUSER";
+     $$self{obj_id} eq conf("webuser") ||
+     return "#-1 FUNCTION (COMPRESS) EXPECTS 1 WIZARD FLAG OR IS WEBUSER";
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
      return "#-1 FUNCTION (COMPRESS) EXPECTS 1 ARGUMENT";
 
    my $txt = evaluate($self,$prog,shift);
@@ -13400,14 +12597,12 @@ sub fun_uncompress
    my ($self,$prog) = (obj(shift),shift);
 
    if(!module_enabled("compress")) {
-      return "#-1 FUNCTION DISABLED (UNCOMPRESS MODULE DISABLED)";
+      return "#-1 FUNCTION DISABLED (COMPRESS MODULE DISABLED)";
    }
+     $$self{obj_id} eq conf("webuser") ||
+     return "#-1 FUNCTION (COMPRESS) EXPECTS 1 WIZARD FLAG OR IS WEBUSER";
 
-   hasflag($self,"WIZARD") ||
-     owner_id($$self{obj_id}) eq conf("webuser") ||
-     return "#-1 FUNCTION (UNCOMPRESS) EXPECTS WIZARD FLAG OR IS WEBUSER";
-
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
      return "#-1 FUNCTION (UNCOMPRESS) EXPECTS 1 ARGUMENT";
 
    my $txt = evaluate($self,$prog,shift);
@@ -13419,7 +12614,7 @@ sub fun_reverse
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
      return "#-1 FUNCTION (REVERSE) EXPECTS 1 ARGUMENT";
 
    return reverse evaluate($self,$prog,shift);
@@ -13429,7 +12624,7 @@ sub fun_revwords
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
      return "#-1 FUNCTION (REVWORDS) EXPECTS 1 ARGUMENT";
 
    return join(' ',reverse split(/\s+/,evaluate($self,$prog,shift)));
@@ -13444,7 +12639,7 @@ sub fun_telnet
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
      return "#-1 FUNCTION (TELNET_OPEN) EXPECTS 1 ARGUMENT";
 
    my $txt = lc(evaluate($self,$prog,shift));
@@ -13462,7 +12657,7 @@ sub fun_rand
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
      return "#-1 FUNCTION (RAND) EXPECTS 1 ARGUMENT";
 
    my $txt = evaluate($self,$prog,shift);
@@ -13490,7 +12685,7 @@ sub fun_lrand
    my ($self,$prog) = (obj(shift),shift);
    my @result;
 
-   good_args(\@_,3,4) ||
+   good_args($#_,3,4) ||
      return "#-1 FUNCTION (LRAND) EXPECTS 3 OR 4 ARGUMENTS";
 
    my $lower = evaluate($self,$prog,shift);
@@ -13522,7 +12717,7 @@ sub fun_lexits
    my ($self,$prog) = (obj(shift),shift);
    my @result;
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
      return "#-1 FUNCTION (LEXITS) EXPECTS 1 ARGUMENT";
 
    my $target = find($self,$prog,evaluate($self,$prog,shift)) ||
@@ -13543,7 +12738,7 @@ sub fun_lcon
    my ($self,$prog) = (obj(shift),shift);
    my @result;
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
      return "#-1 FUNCTION (LCON) EXPECTS 1 ARGUMENT";
 
    my $target = find($self,$prog,evaluate($self,$prog,shift)) ||
@@ -13655,7 +12850,7 @@ sub fun_run
    my ($self,$prog) = (shift,shift);
    my (%none, $hash, %tmp, $match, $cmd,$arg);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
       return "#-1 FUNCTION (RUN) REQUIRES 1 ARGUMENT";
 
    in_run_function($prog) &&
@@ -13698,8 +12893,8 @@ sub safe_split
    my $orig = $txt;
    $delim = ansi_remove($delim);
 
-   if($delim =~ /^\s*([\r\n]+)\s*/m) {
-      $delim = $1;
+   if($delim =~ /^\s*\n\s*/m) {
+      $delim = "\n";
    } else {
       $delim =~ s/^\s+|\s+$//g;
 
@@ -13744,14 +12939,11 @@ sub list_functions
 
 sub good_args
 {
-   my ($arg,@possible) = @_;
+   my ($count,@possible) = @_;
+   $count++;
 
    for my $i (0 .. $#possible) {
-      if($i == 0 && defined $$arg[0] && $$arg[0] eq undef) {
-         return 1;
-      } else {
-         return 1 if($#$arg + 1 == $possible[$i]);
-      }
+      return 1 if($count eq $possible[$i]);
    }
    return 0;
 }
@@ -13893,7 +13085,7 @@ sub fun_lwho
    my ($self,$prog) = (shift,shift);
    my @who;
 
-   good_args(\@_,0,1) ||
+   good_args($#_,0,1) ||
       return "#-1 FUNCTION (LWHO) EXPECTS 0 OR 1 ARGUMENTS-$#_";
 
    my $flag = evaluate($self,$prog,shift);
@@ -13908,19 +13100,14 @@ sub fun_lwho
       if($$hash{raw} != 0||!defined $$hash{obj_id}||$$hash{obj_id} eq undef) {
          next;
       }
-
-      if(hasflag(@connected{$key},"DARK") && !hasflag($self,"WIZARD")) {
-         # do not list dark players
+      if($flag) {
+         push(@who,
+              "#" .
+              @{@connected{$key}}{obj_id} . ":" .
+              @{@connected{$key}}{port}
+             );
       } else {
-         if($flag) {
-            push(@who,
-                 "#" .
-                 @{@connected{$key}}{obj_id} . ":" .
-                 @{@connected{$key}}{port}
-                );
-         } else {
-            push(@who,"#" . @{@connected{$key}}{obj_id});
-         }
+         push(@who,"#" . @{@connected{$key}}{obj_id});
       }
    }
    return join(' ',@who);
@@ -13932,7 +13119,7 @@ sub fun_lcstr
    my ($self,$prog) = (shift,shift);
    my @out;
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
      return "#-1 FUNCTION (LCSTR) EXPECTS 1 ARGUMENT ($#_)";
 
    while($#_ >= 0) {
@@ -13951,7 +13138,7 @@ sub fun_home
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,0,1) ||
+   good_args($#_,0,1) ||
       return "#-1 FUNCTION (HOME) EXPECT 0 OR 1 ARGUMENT";
 
    if(@_[0] eq undef) {
@@ -13976,7 +13163,7 @@ sub fun_capstr
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
      return "#-1 FUNCTION (SQUISH) EXPECTS 1 ARGUMENT ($#_)";
 
     return ucfirst(evaluate($self,$prog,shift));
@@ -13993,7 +13180,7 @@ sub fun_squish
    my $txt = @_[0];
    my $y;
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
      return "#-1 FUNCTION (SQUISH) EXPECTS 1 ARGUMENT ($#_)";
 
    my $txt = ansi_init(evaluate($self,$prog,shift));
@@ -14044,7 +13231,7 @@ sub fun_eq
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,2) ||
+   good_args($#_,2) ||
       return "#-1 FUNCTION (EQ) EXPECTS 2 ARGUMENTS";
 
    my $one = evaluate($self,$prog,shift);
@@ -14059,7 +13246,7 @@ sub fun_loc
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
       return "#-1 FUNCTION (LOC) EXPECTS 1 ARGUMENT";
 
    my $target = find($self,$prog,evaluate($self,$prog,shift));
@@ -14088,7 +13275,7 @@ sub fun_findable
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,2) ||
+   good_args($#_,2) ||
       return "#-1 FUNCTION (FINDABLE) EXPECTS 2 ARGUMENTS";
 
    my $obj = find($self,$prog,evaluate($self,$prog,shift)) ||
@@ -14112,7 +13299,7 @@ sub fun_orflags
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,2) ||
+   good_args($#_,2) ||
       return "#-1 FUNCTION (HASFLAG) EXPECTS 2 ARGUMENTS";
 
    my $target = find($self,$prog,evaluate($self,$prog,shift)) ||
@@ -14132,7 +13319,7 @@ sub fun_hasflag
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,2) ||
+   good_args($#_,2) ||
       return "#-1 FUNCTION (HASFLAG) EXPECTS 2 ARGUMENTS";
 
    if((my $target = find($self,$prog,evaluate($self,$prog,shift))) ne undef) {
@@ -14146,7 +13333,7 @@ sub fun_gt
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,2) ||
+   good_args($#_,2) ||
       return "#-1 FUNCTION (GT) EXPECTS 2 ARGUMENTS";
 
    my $one = evaluate($self,$prog,shift);
@@ -14159,7 +13346,7 @@ sub fun_gte
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,2) ||
+   good_args($#_,2) ||
       return "#-1 FUNCTION (GTE) EXPECTS 2 ARGUMENTS";
 
    my $one = evaluate($self,$prog,shift);
@@ -14172,7 +13359,7 @@ sub fun_lt
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,2) ||
+   good_args($#_,2) ||
       return "#-1 FUNCTION (LT) EXPECTS 2 ARGUMENTS";
 
    my $one = evaluate($self,$prog,shift);
@@ -14185,7 +13372,7 @@ sub fun_lte
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,2) ||
+   good_args($#_,2) ||
       return "#-1 FUNCTION (LT) EXPECTS 2 ARGUMENTS";
 
    my $one = evaluate($self,$prog,shift);
@@ -14210,7 +13397,7 @@ sub fun_bor
    my ($self,$prog) = (shift,shift);
    my $result = 0;
 
-   good_args(\@_,1 .. 100) ||
+   good_args($#_,1 .. 100) ||
       return "#-1 FUNCTION (BOR) EXPECTS 1 AND 100 ARGUMENTS";
 
    for my $i (@_) {
@@ -14229,7 +13416,7 @@ sub fun_isnum
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
       return "#-1 FUNCTION (ISNUM) EXPECTS 1 ARGUMENT";
 
    my $val = evaluate($self,$prog,shift);
@@ -14242,7 +13429,7 @@ sub fun_lnum
    my ($self,$prog) = (shift,shift);
    my @result;
 
-   good_args(\@_,1,2,3,4) ||
+   good_args($#_,1,2,3,4) ||
       return "#-1 FUNCTION (LNUM) EXPECTS 1,2,3 OR 4 ARGUMENTS";
 
    my $start  = evaluate($self,$prog,shift);
@@ -14287,7 +13474,7 @@ sub fun_not
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
       return "#-1 FUNCTION (NOT) EXPECTS 1 ARGUMENTS";
 
    return (! evaluate($self,$prog,shift)) ? 1 : 0;
@@ -14298,11 +13485,12 @@ sub fun_words
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,1,2) ||
+   good_args($#_,1,2) ||
       return "#-1 FUNCTION (WORDS) EXPECTS 1 OR 2 ARGUMENTS";
 
-   my $txt = trim(ansi_remove(evaluate($self,$prog,shift)));
+   my $txt = trim(evaluate($self,$prog,shift));
    my $delim = evaluate($self,$prog,shift);
+
    return scalar(safe_split(ansi_remove($txt),
                             ($delim eq undef) ? " " : $delim
                            )
@@ -14318,7 +13506,7 @@ sub fun_match
    my ($self,$prog) = (obj(shift),shift);
    my $count = 1;
 
-   good_args(\@_,1,2,3) ||
+   good_args($#_,1,2,3) ||
       return "#-1 FUNCTION (MATCH) EXPECTS 1, 2 OR 3 ARGUMENTS";
 
    my $txt   = evaluate($self,$prog,shift);
@@ -14389,7 +13577,7 @@ sub fun_strmatch
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,2) ||
+   good_args($#_,2) ||
       return "#-1 FUNCTION (STRMATCH) EXPECTS 2 ARGUMENTS";
 
    my $txt   = evaluate($self,$prog,shift);
@@ -14404,7 +13592,7 @@ sub fun_inc
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,0,1) ||
+   good_args($#_,0,1) ||
       return "#-1 FUNCTION (INC) EXPECTS 0 OR 1 ARGUMENTS";
 
    my $number = evaluate($self,$prog,shift);
@@ -14420,7 +13608,7 @@ sub fun_dec
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,0,1) ||
+   good_args($#_,0,1) ||
       return "#-1 FUNCTION (DEC) EXPECTS 0 OR 1 ARGUMENTS";
 
    my $number = evaluate($self,$prog,shift);
@@ -14436,7 +13624,7 @@ sub fun_center
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,2,3) ||
+   good_args($#_,2,3) ||
       return "#-1 FUNCTION (CENTER) EXPECTS 2 OR 3 ARGUMENTS";
 
    my $txt = evaluate($self,$prog,shift);
@@ -14489,14 +13677,6 @@ sub fun_switch
          my $txt = single_line(evaluate($self,$prog,trim(shift)));
          my $cmd = shift;
 
-         if(hasflag($self,"COMPAT")) {
-            $cmd =~ s/\\(.)/\1/g;      # HACK, standard TM is broken and
-                                       # escapes are not properly handled in
-                                       # switch(). THe fix is to remove one
-                                       # "level" of escapes. 
-                                       # example: so \\[ becomes [
-         }
-
          if(ansi_remove($txt) =~ /^\s*(<|>)\s*/) {
              if($1 eq ">" && $first > $' || $1 eq "<" && $first < $') {
                 return evaluate($self,$prog,$cmd);
@@ -14521,15 +13701,7 @@ sub fun_switch
             }
          }
       } else {                                      # handle switch() default
-         my $cmd = shift;
-         if(hasflag($self,"COMPAT")) {
-            $cmd =~ s/\\(.)/\1/g;      # HACK, standard TM is broken and
-                                       # escapes are not properly handled in
-                                       # switch(). THe fix is to remove one
-                                       # "level" of escapes. 
-                                       # example: so \\[ becomes [
-         }
-         return evaluate($self,$prog,$cmd);
+         return evaluate($self,$prog,shift);
       }
    }
 }
@@ -14539,7 +13711,7 @@ sub fun_member
    my ($self,$prog) = (shift,shift);
    my $i = 1;
 
-   good_args(\@_,2,3) ||
+   good_args($#_,2,3) ||
       return "#-1 FUNCTION (MEMBER) EXPECTS 2 OR 3 ARGUMENTS";
 
    my $txt   = evaluate($self,$prog,shift);
@@ -14560,7 +13732,7 @@ sub fun_index
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,4) ||
+   good_args($#_,4) ||
       return "#-1 FUNCTION (INDEX) EXPECTS 4 ARGUMENTS";
 
    my $txt = evaluate($self,$prog,shift);
@@ -14588,7 +13760,7 @@ sub fun_replace
    my ($self,$prog) = (shift,shift);
    my $i = 1;
 
-   if(!good_args(\@_,3,4,5)) {
+   if(!good_args($#_,3,4,5)) {
       return "#-1 FUNCTION (REPLACE) EXPECTS 3, 4 or 5 ARGUMENTS";
    }
 
@@ -14636,42 +13808,24 @@ sub fun_after
    }
 }
 
+
 sub fun_rest
 {
    my ($self,$prog) = (shift,shift);
-   my $found = 0;
 
-   good_args(\@_,1 .. 2) ||
+   good_args($#_,1 .. 2) ||
       return "#-1 Function (REST) EXPECTS 1 or 2 ARGUMENTS";
 
-   my $txt = ansi_init(evaluate($self,$prog,shift));
+   my $txt = evaluate($self,$prog,shift);
    my $delim = ansi_remove(evaluate($self,$prog,shift));
-   my $end = ansi_length($txt);
+   $delim = " " if($delim eq undef);
+   my $loc = index(ansi_remove($txt),$delim);
 
-   if($delim eq " " || $delim eq undef) {
-      for(my $i=0;$i < $end;$i++) {
-         my $ch = ansi_char($txt,$i);
-         if($found == 0 && $ch  ne " ") {
-            $found = 1;
-         } elsif($found == 1 && $ch eq " ") {
-            $found = 2;
-         } elsif($found == 2 && $ch ne " ") {
-            return ansi_substr($txt,$i);
-         }
-      }
+   if($loc == -1) {
+      return $txt;
    } else {
-      for(my $i=0;$i < $end;$i++) {
-         my $ch = ansi_char($txt,$i);
-         if($ch eq $delim) {
-            $found++;
-
-            if($found == 1) {
-               return ansi_substr($txt,$i+length($delim));
-            }
-         }
-      }
+      return fun_trim($self,$prog,ansi_substr($txt,$loc + length($delim),9999));
    }
-   return undef;
 }
 
 sub fun_first
@@ -14679,7 +13833,7 @@ sub fun_first
    my ($self,$prog) = (shift,shift);
 
 
-   good_args(\@_,1,2) ||
+   good_args($#_,1,2) ||
       return "#-1 Function (FIRST) EXPECTS 1 or 2 ARGUMENTS";
 
    my $txt = evaluate($self,$prog,shift);
@@ -14703,7 +13857,7 @@ sub fun_last
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,1,2) ||
+   good_args($#_,1,2) ||
       return "#-1 Function (LAST) EXPECTS 1 or 2 ARGUMENTS";
 
    my $txt = evaluate($self,$prog,shift);
@@ -14737,7 +13891,7 @@ sub fun_before
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,1,2) ||
+   good_args($#_,1,2) ||
       return "#-1 Function (BEFORE) EXPECTS 1 or 2 ARGUMENTS";
 
    my $txt = evaluate($self,$prog,shift);
@@ -14876,7 +14030,7 @@ sub fun_mul
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,1 .. 100) ||
+   good_args($#_,1 .. 100) ||
       return "#-1 FUNCTION (MUL) EXPECTS BETWEEN 1 and 100 ARGUMENTS";
 
    my $result = ansi_remove(evaluate($self,$prog,shift));
@@ -14936,7 +14090,7 @@ sub fun_edit
    my ($self,$prog) = (shift,shift);
    my ($start,$out);
 
-   good_args(\@_,3,4,5) ||
+   good_args($#_,3,4,5) ||
       return "#-1 FUNCTION (EDIT) EXPECTS 3 AND 5 ARGUMENTS";
 
    my $txt    = evaluate($self,$prog,shift);
@@ -14991,16 +14145,15 @@ sub fun_num
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
       return "#-1 FUNCTION (NUM) EXPECTS 1 ARGUMENT";
 
-   my $num = evaluate($self,$prog,$_[0]);
    my $result = find($self,$prog,evaluate($self,$prog,$_[0]));
 
-   if(ref($result) && defined $$result{obj_id}) {
-      return "#$$result{obj_id}";
-   } else {
+   if($result eq undef) {
       return "#-1";
+   } else {
+      return "#$$result{obj_id}";
    }
 }
 
@@ -15012,7 +14165,7 @@ sub fun_isdbref
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
       return "#-1 FUNCTION (ISDBREF) EXPECTS 1 ARGUMENT";
 
    my $dbref =evaluate($self,$prog,shift);
@@ -15030,7 +14183,7 @@ sub fun_locate
    my (%result, @r, $prefer);
    my $random = 0;
 
-   good_args(\@_,3) ||
+   good_args($#_,3) ||
       return "#-1 FUNCTION (LOCATE) EXPECTS 3 ARGUMENT";
 
    my $target = find($self,$prog,evaluate($self,$prog,shift)) ||
@@ -15130,7 +14283,7 @@ sub fun_owner
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
       return "#-1 FUNCTION (OWNER) EXPECTS 1 ARGUMENT";
 
    my $target = find($self,$prog,evaluate($self,$prog,shift)) ||
@@ -15152,7 +14305,7 @@ sub fun_name
 #   }
    my ($flag,$self,$prog) = (shift,shift,shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
       return "#-1 FUNCTION (NAME) EXPECTS 1 ARGUMENT - $#_";
 
    my $target = find($self,$prog,evaluate($self,$prog,shift));
@@ -15171,7 +14324,7 @@ sub fun_type
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
       return "#-1 FUNCTION (TYPE) EXPECTS 1 ARGUMENT";
 
    my $target= find($self,$prog,evaluate($self,$prog,$_[0])) ||
@@ -15185,7 +14338,7 @@ sub fun_filter
    my ($self,$prog) = (obj(shift),shift);
    my @result;
 
-   good_args(\@_,2,3,4) ||
+   good_args($#_,2,3,4) ||
       return "#-1 FUNCTION (FILTER) EXPECTS BETWEEN 2 and 4 ARGUMENTS";
 
    my ($obj,$atr) = meval($self,$prog,balanced_split(shift,"\/",4));
@@ -15242,13 +14395,14 @@ sub fun_u
       $txt = evaluate($self,$prog,shift);
    }
 
+   for my $i (0 .. $#_) {
+      @arg[$i] = evaluate($self,$prog,$_[$i]);
+   }
+
    if($txt =~ /\//) {                    # input in object/attribute format?
       ($obj,$attr) = (find($self,$prog,$`,"LOCAL"),$');
    } else {                                  # nope, just contains attribute
       ($obj,$attr) = ($self,$txt);
-   }
-   for my $i (0 .. $#_) {
-      @arg[$i] = evaluate($self,$prog,$_[$i]);
    }
 
    if($obj eq undef) {
@@ -15423,7 +14577,7 @@ sub fun_edefault
    my ($self,$prog) = (shift,shift);
    my ($txt,$obj,$attr,@arg,%temp);
 
-   good_args(\@_,2) ||
+   good_args($#_,2) ||
      return "#-1 FUNCTION (EDEFAULT) EXPECTS 2 ARGUMENTS";
 
    my ($target,$atr) = besplit($self,$prog,shift);
@@ -15434,7 +14588,7 @@ sub fun_edefault
    my $dat = get($target,$atr);
    return evaluate($self,$prog,shift) if($target eq $dat);
 
-   return evaluate($self,$prog,$dat);
+   return evalate($self,$prog,$dat);
 }
 
 sub hash_item
@@ -15462,7 +14616,7 @@ sub fun_keys
    my ($self,$prog) = (shift,shift);
    my ($obj,$atr,$sub);
 
-   good_args(\@_,1,2) ||
+   good_args($#_,1,2) ||
       return "#-1 FUNCTION (KEYS) EXPECTS BETWEEN 1 and 2 ARGUMENTS";
 
    if($#_ == 0) {
@@ -15496,7 +14650,7 @@ sub fun_get
    my ($self,$prog) = (obj(shift),shift);
    my ($obj,$atr,$sub);
 
-   good_args(\@_,1,2) ||
+   good_args($#_,1,2) ||
       return "#-1 FUNCTION (GET) EXPECTS BETWEEN 1 and 2 ARGUMENTS";
 
    if($#_ == 0) {
@@ -15535,7 +14689,7 @@ sub fun_default
    my ($self,$prog) = (obj(shift),shift);
    my ($obj,$atr,$sub);
 
-   good_args(\@_,2) ||
+   good_args($#_,2) ||
       return "#-1 FUNCTION (DEFAULT) EXPECTS 2 ARGUMENTS";
 
    ($obj,$atr) = besplit($self,$prog,shift,"\/");
@@ -15560,21 +14714,17 @@ sub fun_default
    }
 }
 
-#
-# fun_eval
-#    evaluate an attribute in eval(obj,attr) or eval(obj/attr) format,
-#    or evaluate the string passed in.
-#
 sub fun_eval
 {
    my ($self,$prog,$txt) = (shift,shift,shift);
 
+#   printf("EVAL: '%s' -> '%s'\n",$txt,evaluate($self,$prog,evaluate($self,$prog,evaluate($self,$prog,$txt))));
    if($#_ == 0) {
       return evaluate($self,$prog,fun_get($self,$prog,$txt . "/" . $_));
    } elsif($txt =~ /\//) {
       return evaluate($self,$prog,fun_get($self,$prog,$txt));
    } else {
-      return evaluate($self,$prog,evaluate($self,$prog,$txt));
+      return evaluate($self,$prog,evaluate($self,$prog,evaluate($self,$prog,$txt)));
    }
 }
 
@@ -15642,7 +14792,7 @@ sub fun_setr
    my ($self,$prog) = (shift,shift);
    my ($new_size, $old_size);
 
-   good_args(\@_,2) ||
+   good_args($#_,2) ||
       return "#-1 FUNCTION (SETR) EXPECTS 2 ARGUMENTS";
 
    my $register = lc(trim(evaluate($self,$prog,shift)));
@@ -15664,11 +14814,10 @@ sub fun_setr
 #
 sub fun_setq
 {
-   my ($self,$prog) = (shift,shift);
-   good_args(\@_,2) ||
+   good_args($#_ - 2,2) ||
       return "#-1 FUNCTION (SETQ) EXPECTS 2 ARGUMENTS";
 
-   fun_setr($self,$prog,@_);                                    # reuse code
+   fun_setr(@_);                                              # reuse code
    return undef;
 }
 
@@ -15676,7 +14825,7 @@ sub fun_r
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
       return "#-1 FUNCTION (R) EXPECTS 1 ARGUMENTS";
 
    my $register = trim(evaluate($self,$prog,shift));
@@ -15687,8 +14836,8 @@ sub fun_r
       } else {
          return undef;
        }
-   } elsif(defined $$prog{var}->{lc($register)}) {
-      return $$prog{var}->{lc($register)};
+   } elsif(defined $$prog{var}->{$register}) {
+      return $$prog{var}->{$register};
    } else {
       return undef;
    }
@@ -15699,7 +14848,7 @@ sub fun_elements
    my ($self,$prog) = (shift,shift);
    my (@list,@number,@out);
 
-   good_args(\@_,2,3,4) ||
+   good_args($#_,2,3,4) ||
       return "#-1 FUNCTION (ELEMENTS) EXPECTS BETWEEN 2 AND 4 ARGUMENTS";
 
    my $txt     = evaluate($self,$prog,shift);
@@ -15725,7 +14874,7 @@ sub fun_extract
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,3,4,5) ||
+   good_args($#_,3,4,5) ||
       return "#-1 FUNCTION (EXTRACT) EXPECTS BETWEEN 3 AND 5 ARGUMENTS";
 
    my $txt    = evaluate($self,$prog,shift);
@@ -15759,7 +14908,8 @@ sub fun_extract
 #       trim(join($odelim,@list[$first .. ($first+$length)])));
       return trim(join($odelim,@list[$first .. ($first+$length)]));
    } else {
-#      printf("{%s}\n",join($odelim,@list[$first .. ($first+$length)]));
+#   printf("2Extract: %s,%s,%s,%s='%s'\n",$txt,$first,$length,$idelim,$odelim,
+#      join($odelim,@list[$first .. ($first+$length)]));
       return join($odelim,@list[$first .. ($first+$length)]);
    }
 }
@@ -15768,7 +14918,7 @@ sub fun_delete
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,2,3) ||
+   good_args($#_,2,3) ||
       return "#-1 FUNCTION (DELETE) EXPECTS 3 OR 4 ARGUMENTS";
 
    my $txt = shift;
@@ -15791,7 +14941,7 @@ sub fun_remove
    my ($self,$prog) = (shift,shift);
    my (%remove, @result);
 
-   good_args(\@_,2,3) ||
+   good_args($#_,2,3) ||
       return "#-1 FUNCTION (REMOVE) EXPECTS 2 OR 3 ARGUMENTS";
 
    my $list  = evaluate($self,$prog,shift);
@@ -15825,7 +14975,7 @@ sub fun_rjust
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,2,3) ||
+   good_args($#_,2,3) ||
       return "#-1 FUNCTION (RJUST) EXPECTS 2 OR 3 ARGUMENTS";
 
    my $txt = evaluate($self,$prog,shift);
@@ -15851,7 +15001,7 @@ sub fun_ljust
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,2,3) ||
+   good_args($#_,2,3) ||
       return "#-1 FUNCTION (LJUST) EXPECTS 2 OR 3 ARGUMENTS";
 
    my $txt = evaluate($self,$prog,shift);
@@ -15875,7 +15025,7 @@ sub fun_strlen
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
       return "#-1 FUNCTION (STRLEN) EXPECTS 1 ARGUMENTS";
 
    return ansi_length(ansi_trim(evaluate($self,$prog,shift)));
@@ -15886,7 +15036,7 @@ sub fun_strtrunc
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,2,3) ||
+   good_args($#_,2,3) ||
       return "#-1 FUNCTION (STRTRUNC) EXPECTS 2 arguments";
 
    return fun_substr($self,$prog,shift,0,shift);
@@ -15899,21 +15049,17 @@ sub fun_substr
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,2,3) ||
+   good_args($#_,2,3) ||
       return "#-1 Substr expects 2 - 3 arguments";
 
    my $txt = evaluate($self,$prog,shift);
    my $start = evaluate($self,$prog,shift);
    my $end = evaluate($self,$prog,shift);
 
-   if($start !~ /^\s*\-{0,1}\d+\s*/) {
-      return "#-1 ARGUMENTS MUST BE INTEGERS";
-   } elsif($start < 0 || $start > 16383) {
-      return "#-1 OUT OF RANGE";
-   } elsif($end !~ /^\s*\-{0,1}\d+\s*/) {
-      return "#-1 ARGUEMENTS MUST BE INTEGERS";
-   } elsif($end < 0 || $end > 16383) {
-      return "#-1 OUT OF RANGE";
+   if($start !~ /^\s*\d+\s*/) {
+      return "#-1 Substr expects a numeric value for second argument";
+   } elsif($end !~ /^\s*\d+\s*/) {
+      return "#-1 Substr expects a numeric value for third argument";
    }
 
    return ansi_substr($txt,$start,$end);
@@ -15924,7 +15070,7 @@ sub fun_right
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,2) ||
+   good_args($#_,2) ||
      return "#-1 FUNCTION (RIGHT) EXPECTS 2 ARGUMENT";
 
    my $txt = evaluate($self,$prog,shift);
@@ -15941,7 +15087,7 @@ sub fun_left
 {
    my ($self,$prog) = (obj(shift),shift);
 
-   good_args(\@_,2) ||
+   good_args($#_,2) ||
      return "#-1 FUNCTION (LEFT) EXPECTS 2 ARGUMENT";
 
    my $txt = evaluate($self,$prog,shift);
@@ -15966,10 +15112,10 @@ sub fun_input
 
    if($txt =~ /^\s*last\s*$/i) {
       if(hasflag($self,"WIZARD")) {
-         return echo(self => $self,
-                     prog => $prog,
-                     source => [ "%s", @info{connected_raw}  ],
-                    );
+         return necho(self => $self,
+                      prog => $prog,
+                      source => [ "%s", @info{connected_raw}  ],
+                     );
       } else {
          return "#-1 PERMISSION DENIED";
       }
@@ -16028,7 +15174,7 @@ sub fun_flags
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
      "#-1 FUNCTION (FLAGS) EXPECTS 1 ARGUMENTS";
 
    my $txt = evaluate($self,$prog,shift);
@@ -16051,7 +15197,7 @@ sub fun_space
 {
     my ($self,$prog) = (shift,shift);
 
-    good_args(\@_,0,1) ||
+    good_args($#_,0,1) ||
        return "#-1 Space expects 0 or 1 values";
 
     my $count = evaluate($self,$prog,shift);
@@ -16073,7 +15219,7 @@ sub fun_repeat
 {
    my ($self,$prog) = (shift,shift);
 
-    good_args(\@_,2) ||
+    good_args($#_,2) ||
        return "#-1 FUNCTION (REPEAT) EXPECTS 2 ARGUMENTS";
 
     my $txt = evaluate($self,$prog,shift);
@@ -16083,7 +15229,7 @@ sub fun_repeat
        return "#-1 Repeat expects numeric value for the second arguement";
     }
 
-    if($count > 1000 && $count * length($txt) > 10000000) {
+    if($count > 1000 && $count * length($txt) > 1000) {
        return undef;
     } else {
        return $txt x $count;
@@ -16126,7 +15272,7 @@ sub fun_lattr
    my ($self,$prog) = (shift,shift);
    my ($obj,$atr,@list);
 
-   good_args(\@_,1) ||
+   good_args($#_,1) ||
       return "#-1 FUNCTION (LATTR) EXPECTS 1 ARGUMENT";
 
    my ($obj,$atr) = bsplit(shift,"/");
@@ -16165,7 +15311,7 @@ sub fun_itext
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,0,1) ||
+   good_args($#_,0,1) ||
      return "#-1 FUNCTION (ITEXT) EXPECTS 0 OR 1 ARGUMENTS";
 
    return if(!defined $$prog{iter_stack});                 # not in iter()
@@ -16195,7 +15341,7 @@ sub fun_inum
 {
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,0,1) ||
+   good_args($#_,0,1) ||
      return "#-1 FUNCTION (INUM) EXPECTS 0 OR 1 ARGUMENTS";
 
    return if(!defined $$prog{iter_stack});                 # not in iter()
@@ -16223,7 +15369,7 @@ sub fun_ilev
    }
    my ($self,$prog) = (shift,shift);
 
-   good_args(\@_,0) ||
+   good_args($#_,0) ||
      return "#-1 FUNCTION (ILEV) EXPECTS 0 ARGUMENTS - $#_";
 
    return -1 if(!defined $$prog{iter_stack});                 # not in iter()
@@ -16261,7 +15407,7 @@ sub fun_iter
    my ($self,$prog) = (shift,shift);
    my $count = 0;
 
-   good_args(\@_,2 .. 4) ||
+   good_args($#_,2 .. 4) ||
      return "#-1 FUNCTION (ITER) EXPECTS 2 AND 4 ARGUMENTS";
    my $argc = $#_;
 
@@ -16301,7 +15447,7 @@ sub fun_list
    my ($self,$prog) = (obj(shift),shift);
    my ($count,$target) = (0);
 
-   good_args(\@_,2 .. 4) ||
+   good_args($#_,2 .. 4) ||
      return "#-1 FUNCTION (LIST) EXPECTS 2 AND 4 ARGUMENTS";
    my $argc = $#_;
 
@@ -16327,10 +15473,10 @@ sub fun_list
                                       pos => ++$count };
       my $result = evaluate($self,$prog,$txt);
 #      printf("   # '%s'\n",$result);
-      echo(self   => $self,
-           prog   => $prog,
-           target => [ $target, "%s", $result ],
-          );
+      necho(self   => $self,
+            prog   => $prog,
+            target => [ $target, "%s", $result ],
+      );
    }
    delete @{$$prog{iter_stack}}[$loc .. $#{$$prog{iter_stack}}];
 
@@ -16346,7 +15492,7 @@ sub fun_citer
    my ($count) = 0;
    my @result;
 
-   good_args(\@_,2,3) ||
+   good_args($#_,2,3) ||
      return "#-1 FUNCTION (ITER) EXPECTS 2 OR 3 ARGUMENTS";
    my $argc = $#_;
 
@@ -16477,10 +15623,11 @@ sub parse_function
    }
 }
 
+#
 # balanced_split
 #    Split apart a string but allow the string to have "",{},()s
 #    that keep segments together... but only if they have a matching
-#    pair. This version should be escape sequence friendly.
+#    pair.
 #
 # types:
 #    1 : function split?
@@ -16488,105 +15635,155 @@ sub parse_function
 #    3 : split at delim
 #    4 : split until delim, delim not included in result
 #
-#    FYI: Strings are split using ansi_substr() in as big of segments as
-#         possible to avoid having extra escape sequences.
 sub balanced_split
 {
-   my ($str,$delim,$type,$debug) = (ansi_init(shift),shift,shift,shift);
-   my $end = ansi_length($str);
-   my $stack = [];
-   my $seg = [];
-   my ($i,$start) = (0,0);
-   my ($br,$bl,$pr,$pl) = ("{","}","(",")");                # make vi happy
-#   printf("BS[%s] '%s'\n",$end,ansi_string($str));
+   my ($txt,$delim,$type,$debug) = @_;
+   my ($last,$i,@stack,@depth,$ch,$buf,$found,$escape) = (0,-1);
 
-   for($i=0;$i < $end;$i++) {
-      my $ch = ansi_char($str,$i);                        # get current ch
+   my $size = length($txt);
+   while(++$i < $size) {
+      $ch = substr($txt,$i,1);
 
-      # escaped character or escaped delim via % char but not %{varable}s
-      if($ch eq "\\" || 
-         ($ch eq "%" && ansi_substr($str,$i,undef,1) !~ /^%\{[a-zA-Z0-9\_#]+\}/)) {
-         $i++;
-      } elsif($ch eq $pr) {                              # go down one level
-         push(@$stack,{ ch => $pl, i => $i, start => $start, seg => $#$seg});
-      } elsif($ch eq $br) {                              # go down one level
-         push(@$stack,{ ch => $bl, i => $i, start => $start, seg => $#$seg});
-      } elsif($ch eq $pl) {                              # go up one level?
-         if($#$stack == -1) {                # end of function at right depth
-            if($type <= 2) {
-               push(@$seg,ansi_substr($str,$start,$i-$start));
-               $start = $i + 1;
-               last;
-            }
-         } elsif($ch eq @{@$stack[-1]}{ch}) {
-            pop(@$stack);                  # pair matched, move up one level
-         }
-      } elsif($#$stack >= 0 && $ch eq @{@$stack[-1]}{ch}) {
-         pop(@$stack);                      # pair matched, move up one level
-      } elsif($ch eq $delim && $#$stack == -1) {      # delim at right level
-         push(@$seg,ansi_substr($str,$start,$i-$start));
-         return $$seg[0], ansi_substr($str,$i+1), 1 if($type == 4);
-         $start = $i+1;
-      }
-
-      # processed to end of string but there are still unmatched {}() pairs.
-      # Back out one at a time and see if it eventually parses.
-      if($i + 1 == $end && $#$stack >= 0) {
-         my $rp = pop(@$stack);              # go back one "restore point"
-         $i = $$rp{i};
-         $start = $$rp{start};                # @seg end is invalid, delete
-         delete @$seg[($$rp{seg}+1) .. $#$seg] if($#$seg > $$rp{seg});
-      }
-   }
-
-   if($type == 4) {                         # handle the various return types
-      return ansi_string($str), undef, 0;
-   } elsif($type == 3) {
-      push(@$seg,ansi_substr($str,$start,$end-$start));
-      return @$seg;
-   } else {
-      if($#$stack != -1) {
-         return undef;
+      if($ch eq "\e" && substr($txt,$i,20) =~ /^\e\[([\d;]*)([a-zA-Z])/) {
+         $i += length("x$1$2");                       # move 1 char short
+	 $buf .= "\e\[$1$2";
+      } elsif($ch eq "\\" && $#depth == -1) {
+	 $buf .= $ch;
+	 $escape = 1;
+      } elsif($escape) {
+	 $buf .= $ch;
+	 $escape = 0;
       } else {
-         unshift(@$seg,ansi_substr($str,$start,$end-$start));
-         return @$seg;
+         if($ch eq "(" || $ch eq "{") {                  # start of segment
+            $buf .= $ch;
+            push(@depth,{ ch    => $ch,
+                          last  => $last,
+                          i     => $i,
+                          stack => $#stack+1,
+                          buf   => $buf
+                        });
+         } elsif($#depth >= 0) {
+            $buf .= $ch;
+            if($ch eq ")" && @{@depth[$#depth]}{ch} eq "(") {
+               pop(@depth);
+            } elsif($ch eq "}" && @{@depth[$#depth]}{ch} eq "{") {
+               pop(@depth);
+            }
+         } elsif($#depth == -1) {
+            if($ch eq $delim) {    # delim at right depth
+               $found = 1;
+               if($type == 4) {                        # found delim, done
+                  return $buf, substr($txt,$i+1), 1;
+               } else {
+                  push(@stack,$buf);
+                  $last = $i+1;
+                  $buf = undef;
+               }
+            } elsif($type <= 2 && $ch eq ")") {                   # func end
+               push(@stack,$buf) if($found || $i != $last);
+               $last = $i+1;
+               $i = $size;
+               $buf = undef;
+               $found = 0;
+               last;                                      # jump out of loop
+            } else {
+               $buf .= $ch;
+            }
+         } else {
+            $buf .= $ch;
+         }
+      }
+      if($i +1 >= $size && $#depth != -1) {   # parse error, start unrolling
+         my $hash = pop(@depth);
+         $i = $$hash{i};
+         delete @stack[$$hash{stack} .. $#stack];
+         $last = $$hash{last};
+         $buf = $$hash{buf};
       }
    }
+
+   if($type == 4) {
+      return $buf, undef, 0;
+#   } elsif($type == 3 || $type == 4) {
+   } elsif($type == 3) {
+      push(@stack,substr($txt,$last)) if($found || $last != $size);
+      #      push(@stack,$buf) if($found || $last != $size);
+      return @stack;
+   } else {
+	   unshift(@stack,substr($txt,$last));
+	   # unshift(@stack,$buf);
+      return ($#depth != -1) ? undef : @stack;
+   }
 }
 
-
-#
-# used to debug balanced_split, remove after the new version of
-# balanced split is veted properly.
-#
-sub stack_compare
+sub balanced_add
 {
-   my ($txt,$delim,$type,$flag) = @_;
-   my ($i,$old,$new,$out1, $out2);
-   my $orig = $txt;
+   my ($depth,$stack,$ch,$new) = @_;
 
-   my $i;
-   for my $seg (old_balanced_split($txt,$delim,$flag)) {
-      ++$old;
-      $out1 .= sprintf("%s : '%s'\n",++$i,$seg);
+   push(@$stack,{depth => 0, data => undef}) if $#$stack < 0;
+   if($$stack[-1]->{done} && ($depth == 1 || $depth == 0 && $new)) {
+      push(@$stack,{ depth => $depth, data => $ch });
+   } else {
+      $$stack[-1]->{data} .= $ch;
    }
-
-   my $i;
-   for my $seg (sbalanced($txt,$delim,$flag)) {
-      ++$new;
-      $out2 .= sprintf("%s : '%s'\n",++$i,ansi_debug($seg));
-   }
-
-
-   if(1 || ansi_remove($out1) ne ansi_remove($out2) || $new ne $old || $txt ne $orig) {
-      printf("TEXT:  '%s'\n",$txt);
-      printf("delim: '%s'\n",$delim);
-      printf("type:  '%s'\n",$type);
-      printf("code:  '%s'\n",code());
-      printf("---[ OLD Start <$old>]----\n%s--[ OLD  End  ]----\n",$out1);
-      printf("---[ NEW Start <$new>]----\n%s--[ NEW  End  ]----\n\n",$out2);
-   }
+   $$stack[-1]->{done} = $new;
 }
+
+sub new_balanced_split
+{
+   my ($txt,$delim) = @_;
+   my ($depth,$look,$stack) = (0, undef,[]);
+
+#   printf("NEW: '%s'\n",$txt);
+
+   for(my ($size,$i)=(length($txt),0);$i < $size;$i++) {
+      my $ch = substr($txt,$i,1);
+
+      if($ch eq "\\") {                                   # character escaped
+         balanced_add($depth,$stack,substr($txt,$i++,2));
+      } elsif($ch eq "\e" && substr($txt,$i,20) =~ /^\e\[([\d;]*)([a-zA-Z])/) {
+         $i += length("x$1$2");                       # found escape sequence
+         balanced_add($depth,$stack,"\e\[$1$2");
+      } elsif($look ne undef) {                          # slurp up charaters
+         balanced_add($depth,$stack,$ch);
+         $look = undef if $look eq $ch;                        # end look for
+      } elsif($ch eq '{') {                              # start look for '}'
+         balanced_add($depth,$stack,$ch);
+         $look = '}';
+      } elsif($ch eq "(") {
+         if($delim ne undef || $depth >= 1) {
+            balanced_add(++$depth,$stack,$ch,0);
+         } else {
+            balanced_add(++$depth,$stack,$ch,1);
+         }
+      } elsif($depth == 0 && $delim ne undef && $ch eq $delim) {
+         $$stack[-1]->{done} = 1;                        # delim end of split
+         balanced_add($depth,$stack,"<".substr($txt,$i+1).">",1);
+         return $stack;
+      } elsif($depth == 1 && $delim eq undef && $ch eq ')') {
+         $$stack[-1]->{done} = 1;                     # function end of split
+         balanced_add(--$depth,$stack,substr($txt,$i),1);
+         return $stack;
+      } elsif($ch eq ")") {                                        # go down
+         balanced_add(--$depth,$stack,$ch);
+      } elsif($delim eq undef && $ch eq ",") {                  # delimiter
+         if($depth == 1) {
+            balanced_add($depth,$stack,undef,1);
+         } else {
+            balanced_add($depth,$stack,$ch);
+         }
+      } elsif($delim ne undef && $ch eq $delim && $depth == 0) { # comma end
+         $$stack[-1]->{done} = 1;
+         balanced_add(--$depth,$stack,substr($txt,$i),1);
+         return $stack;
+      } else {                                           # non-important char
+         balanced_add($depth,$stack,$ch);
+      }
+   }
+
+   return ($delim ne undef) ? $stack : undef;
+}
+
 
 
 #
@@ -16629,91 +15826,6 @@ sub meval
    return @result;
 }
 
-sub mush_eval
-{
-   my ($self,$prog,$txt) = @_;
-
-   if(!defined conf_true("TALKER")) {
-      return evaluate($self,$prog,$txt);
-   } else {
-      my $tmp_read  = $$prog{read_only};
-      my $tmp_always = $$prog{eval_always};
-
-      $$prog{eval_always} = 1;
-      @$prog{read_only} = 1;
-      my $result = evaluate($self,$prog,$txt);
-
-      if(defined $tmp_read) {
-         $$prog{read_only} = $tmp_read;
-      } else {
-         delete $$prog{read_only};
-      }
-
-      if(defined $tmp_always) {
-         $$prog{eval_always} = $tmp_always;
-      } else {
-         delete $$prog{eval_always};
-      }
-
-      return $result;
-   }
-}
-
-sub fun
-{
-   my ($fun,$self,$prog,@args) = @_;
-   
-   if(hasflag(owner($self),"DEBUG_FUN")) {
-      my (%temp,@result,@eval);
-      my $prev = get_digit_variables($prog);                   # save %0 .. %9
-
-      my $prev = get_digit_variables($prog);                   # save %0 .. %9
-      if(!set_digit_variables($self,$prog,"",@args)) {  # update to new values
-         return managed_var_set_error("#-1");
-      }
-
-      if(defined $$prog{var}) {
-         for my $key (grep {/^setq_/} keys %{$$prog{var}}) { # store prev values
-            @temp{$key} = $$prog{var}->{$key};
-            if(!managed_var_set($prog,$key,undef)) {
-               return managed_var_set_error("#-1");
-            }
-         }
-      }
-
-      for my $i (0 .. $#args) {
-         push(@result,evaluate_substitutions($self,$prog,@args[$i]));
-         push(@eval,sprintf("    %s -> %s",@args[$i],evaluate($self,$prog,@args[$i])));
-      }
-      if($#args == -1) {
-         con("    NO ARGS??\n");
-      }
-
-      if(!set_digit_variables($self,$prog,"",$prev)) {        # restore %0 .. %9
-         return managed_var_set_error("#-1");
-      }
-
-      if(defined $$prog{var}) {
-         for my $key (grep {/^setq_/} keys %{$$prog{var}}) { # restore values
-            if(!managed_var_set($prog,$key,undef)) {
-               return managed_var_set_error("#-1");
-            }
-         }
-         for my $key (keys %temp) {
-            if(!managed_var_set($prog,$key,@temp{$key})) {
-               return managed_var_set_error("#-1");
-            }
-         }
-      }
-      my $result = &{@fun{$fun}}($self,$prog,@args);
-      #con("DEBUG: '[%s(%s)]' = '%s'\n%s",$fun,join(',',@result),$result,join("\n",@eval));
-      con("DEBUG: '[%s(%s)]' = '%s'\n%s\n",$fun,join(',',@result),$result,join("\n",@eval));
-      return $result;
-   }
-
-   return &{@fun{$fun}}($self,$prog,@args);
-}
-
 #
 # evaluate_string
 #    Take a string and parse/run any functions in the string.
@@ -16724,7 +15836,6 @@ sub evaluate
    my $id = (ref($self) eq "HASH") ? $$self{obj_id} : $self;
    my $out;
 
-   return $txt if(conf_true("TALKER") && !defined $$prog{eval_always});
    #
    # handle string containing a single non []'ed function
    #
@@ -16740,7 +15851,7 @@ sub evaluate
 
             my $start = Time::HiRes::gettimeofday();
             $$prog{mush_function_name} = $1 if($fun eq "EVAL");
-            my $r=fun($fun,$id,$prog,@$result);
+            my $r=&{@fun{$fun}}($id,$prog,@$result);
             delete @$prog{mush_function_name};
             $$prog{function_duration} +=Time::HiRes::gettimeofday()-$start;
             $$prog{"fun_$fun"}++;
@@ -16776,7 +15887,7 @@ sub evaluate
 
             my $start = Time::HiRes::gettimeofday();
             $$prog{mush_function_name} = $unmod if($fun eq "EVAL");
-            my $r=fun($fun,$id,$prog,@$result);
+            my $r = &{@fun{$fun}}($id,$prog,@$result);
             delete @$prog{mush_function_name};
             $$prog{function_duration} +=Time::HiRes::gettimeofday()-$start;
 
@@ -16833,33 +15944,20 @@ sub http_accept
 {
    my $s = shift;
 
-   my $new = $s->accept();
-   return unless $new;
+   my $new = $web->accept();
 
    my $addr = server_hostname($new);
 
-   if(conf_true("http_secure")) {
-      IO::Socket::SSL->start_SSL(
-          $new,
-          SSL_server    => 1,
-          SSL_cert_file => "cert.pem",
-          SSL_key_file  => "key.pem",
-      ) or do {
-         web("   %s %s\@web [timeout]\n",ts(),$addr);
-         $new->close;
-         return;
-      }
-   }
-
    if(defined @info{httpd_ban} && defined @{@info{httpd_ban}}{$addr}) {
+      $new->close();
       web("   %s %s\@web [BANNED-CLOSE]\n",ts(),$addr);
       $new->close();
    } else {
       $readable->add($new);
 
-      @http{$new} = { sock     => $new,
-                      data     => {},
-                      ip       => $addr,
+      @http{$new} = { sock => $new,
+                      data => {},
+                      ip   => $addr,
                     };
    }
 }
@@ -16874,6 +15972,62 @@ sub http_disconnect
 }
 
 #
+# manage_httpd_bans
+#    If a client requests an invalid page, assume its not a typo and instead
+#    assume they are hack attempts. I.E. Ban all hosts after X invalid
+#    attempts for an hour.
+#
+sub manage_httpd_bans
+{
+   my $sock = shift;
+   my $count;
+
+   # setup structures
+   @info{httpd_ban} = {} if(!defined @info{httpd_ban});
+   @info{httpd_invalid_data} = {} if(!defined @info{httpd_invalid_data});
+
+   # new invalid request has happened, log it.
+   if($sock ne undef) {
+      my $ip = @http{$sock}->{ip};
+      if(!defined @{@http{$sock}}{$ip}) {
+         @{@http{$sock}}{$ip} = {};
+      }
+      @info{httpd_invalid_data}->{$ip}->{time()}++;
+   }
+
+   #
+   # clean up / manage existing ban data
+   #
+   if(!defined @info{httpd_invalid_data}) {          # no invalid hits at all
+      @info{httpd_invalid_data} = {} if(!defined @info{httpd_invalid_data});
+   } else {                                          # clean up old requests
+      for my $key (keys %{@info{httpd_invalid_data}}) {     # cycle each host
+         my $count = 0;
+         for my $ts (keys %{@info{httpd_invalid_data}->{$key}}) {
+            if(time() - 3600 > $ts) {                           # rm, too old
+               delete @info{httpd_invalid_data}->{$key}->{$ts};
+            } else {                                     # count current hits
+               $count += @info{httpd_invalid_data}->{$key}->{$ts};
+            }
+         }
+
+         if(scalar keys %{@info{httpd_invalid_data}->{$key}} == 0) {
+            delete @info{httpd_invalid_data}->{$key};        # no current hits
+         } elsif($count >= nvl(conf("httpd_invalid"),3)) {
+            if(!defined @{@info{httpd_ban}}{$key}) {
+               @{@info{httpd_ban}}{$key} = scalar localtime();     # too many
+               web("   %s %s\@web *** BANNED **\n",ts(),$key);       # add ban
+            }
+         } elsif(defined @{@info{httpd_ban}}{$key} ) {  # too little,remove ban
+            web("   %s %s\@web Un-BANNNED\n",ts(),$key);
+            delete @{@info{httpd_ban}}{$key};
+         }
+      }
+   }
+}
+
+
+#
 # http_error
 #    Something has gone wrong, inform the broswer.
 #
@@ -16881,12 +16035,18 @@ sub http_error
 {
    my ($s,$fmt,@args) = @_;
 
+   if(defined @http{$s} && defined @http{$s}->{data}) {
+      if(@http{$s}->{data}->{get}  !~ /^\s*(favicon\.ico|robots.txt)\s*$/i) {
+         manage_httpd_bans($s);
+      }
+   }
+
    #
    # show the invalid page responce
    #
    http_out($s,"HTTP/1.1 404 Not Found");
    http_out($s,"Date: %s",scalar localtime());
-   http_out($s,"Last-Modified: %s",http_timestamp());
+   http_out($s,"Last-Modified: %s",scalar localtime());
    http_out($s,"Connection: close");
    http_out($s,"Content-Type: text/html; charset=ISO-8859-1");
    http_out($s,"");
@@ -16948,12 +16108,11 @@ sub http_reply
 
    http_out($s,"HTTP/1.1 200 Default Request");
    http_out($s,"Date: %s",scalar localtime());
-   http_out($s,"Last-Modified: %s",http_timestamp());
+   http_out($s,"Last-Modified: %s",scalar localtime());
    http_out($s,"Connection: close");
    http_out($s,"Content-Type: text/html; charset=ISO-8859-1");
 
    # must store result so cookies can be checked after evaluation
-
    my $result = ansi_remove(evaluate($$prog{user},
                                      $prog,
                                      conf("httpd_template")
@@ -16964,33 +16123,15 @@ sub http_reply
       http_out($s,"Set-Cookie: %s",$$prog{var}->{cookie});
    }
    http_out($s,"");
-   $result =~ s/[\s\n]+$//g;
    http_out($s,"%s\n",$result);
-   $msg = ansi_remove($msg);
-   $msg =~ s/[\s\n]+$//g;
-   http_out($s,"%s\n",$msg);
+   http_out($s,"<body>\n");
+   http_out($s,"<div id=\"Content\">\n");
+   http_out($s,"<pre>%s\n</pre>\n",ansi_remove($msg));
    http_out($s,"</div>\n");
    http_out($s,"</body>\n");
    http_disconnect($s);
 }
 
-sub http_timestamp
-{
-   my $seconds = shift;
-
-   my @day = ("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat");
-   my @month = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec");
-   my @list = gmtime($seconds);
-
-   return sprintf("%s, %02d %s %04d %02d:%02d:%02d GMT",
-                  @day[@list[6]],
-                  @list[3],
-                  @month[@list[4]], @list[5] + 1900,
-                  @list[2],
-                  @list[1],
-                  @list[0]);
-}
 
 #
 # http_reply_simple
@@ -16999,40 +16140,22 @@ sub http_timestamp
 sub http_reply_simple
 {
    my ($s,$type,$fmt,@args) = @_;
-   my ($msg, $mod);
 
-   if($fmt eq "FILE") {
-      if(!good_filename(@args[0])) {
-      web("   %s %s\@web bad file",ts());
-         return http_error($s,"%s","Permission Denied");
-      } else {
-      web("   %s %s\@web good",ts());
-         $mod = (stat("files/@args[0]"))[9];
-         $msg = getbinfile(@args[0]);
-      }
-   } else {
-      $msg = sprintf($fmt,@args);
-   }
+   my $msg = sprintf($fmt,@args);
 
    http_out($s,"HTTP/1.1 200 Default Request");
    http_out($s,"Date: %s",scalar localtime());
-   http_out($s,"Last-Modified: %s",http_timestamp($mod));
+   http_out($s,"Last-Modified: %s",scalar localtime());
    http_out($s,"Connection: close");
    if(lc($type) eq "pdf") {
       http_out($s,"Content-Type: application/pdf; charset=ISO-8859-1");
    } elsif(lc($type) eq "png") {
       http_out($s,"Content-Type: image/png; charset=ISO-8859-1");
-   } elsif(lc($type) eq "jpg") {
-      http_out($s,"Content-Type: image/jpg; charset=ISO-8859-1");
-   } elsif(lc($type) eq "mp4") {
-      http_out($s,"Content-Type: video/mp4; charset=ISO-8859-1");
-   } elsif(lc($type) eq "pl") {
-      http_out($s,"Content-Type: text/text; charset=ISO-8859-1");
    } else {
       http_out($s,"Content-Type: text/$type; charset=ISO-8859-1");
    }
    http_out($s,"");
-   printf({@{@http{$s}}{sock}} "%s",$msg);
+   http_out($s,$fmt,@args);
    http_disconnect($s);
 }
 
@@ -17059,21 +16182,9 @@ sub banable_urls
 {
    my $data = shift;
 
-   if(length($data) > 300) {
+   if($$data{get} =~ /wget http/i) {        # poor wget is abused by hackers
       return 1;
-   } elsif($$data{get} =~ /^\.(git|env)/i) {
-      return 1;
-   } elsif($$data{get} =~ /^remote/i) {
-      return 1;
-   } elsif($$data{get} =~ /^api/i) {                          # no api urls
-      return 1;
-   } elsif($$data{get} =~ /^vpn/i) {                          # no vpn here
-      return 1;
-   } elsif($$data{get} =~ /wget http/i) {   # poor wget is abused by hackers
-      return 1;
-   } elsif($$data{get} =~ /;wget/i) {                            # more wget
-      return 1;
-   } elsif($$data{get} =~ /(phpMyAdmin|phpinfo)/i) {   # really, no php here
+   } elsif($$data{get} =~ /phpMyAdmin/i) {             # really, no php here
       return 1;
    } elsif($$data{get} =~ /trinity/i) {                    # matrix trinity?
       return 1;
@@ -17082,13 +16193,7 @@ sub banable_urls
    } elsif($$data{get} =~ /testget/i) {                        # woot woot!
       # example: http://110.249.212.46/testget?q=23333&port=80
       return 1;
-   } elsif($$data{get} =~ /\.(php|cgi|asp)/i) {       # no php/cgi/asp here
-      return 1;
-   } elsif($$data{get} =~ /etc.*passwd/i) {       # no password files
-      return 1;
-   } elsif($$data{get} =~ /(pmadmin|svg onload)/i) {
-      return 1;
-   } elsif($$data{get} =~ /(brightmail|cgi-bin)/i) {
+   } elsif($$data{get} =~ /\.(php|cgi|asp)$/i) {      # no php/cgi/asp here
       return 1;
    } else {
       return 0;
@@ -17099,8 +16204,17 @@ sub ban_add
 {
    my $sock = shift;
 
-   @info{httd_ban} = {} if(!defined @info{httpd_ban});
-   @info{httpd_ban}->{@http{$sock}->{ip}} = 1;
+   # setup structures
+   @info{httpd_ban} = {} if(!defined @info{httpd_ban});
+   @info{httpd_invalid_data} = {} if(!defined @info{httpd_invalid_data});
+
+   if($sock ne undef) {
+      my $ip = @http{$sock}->{ip};
+      if(!defined @{@http{$sock}}{$ip}) {
+         @{@http{$sock}}{$ip} = {};
+      }
+      @info{httpd_invalid_data}->{$ip}->{time()} = 999999;
+   }
 }
 
 #
@@ -17195,18 +16309,21 @@ sub http_process_line
             ban_add($s);
             web("   %s %s\@web [BANNED-%s]\n",ts(),$addr,$$data{get});
             http_error($s,"%s","BANNED for HACKING");
+         } elsif(defined @{@info{httpd_ban}}{$addr}) {
+            web("   %s %s\@web [BANNED-%s]\n",ts(),$addr,$$data{get});
+            http_error($s,"%s","BANNED for invalid requests");
          } elsif(($$data{get} =~ /_notemplate\.(html)$/i ||  # no template used
-            $$data{get} =~ /\.(ico)$/i) &&
-            -e "files/" . trim($$data{get})) {
+            $$data{get} =~ /\.(js|css|ico)$/i) &&
+            -e "txt/" . trim($$data{get})) {
             web("   %s %s\@web [%s]\n",ts(),$addr,$$data{get});
             http_reply_simple($s,$1,"%s",getfile(trim($$data{get})));
          } elsif($$data{get} !~ /[\\\/]/ &&
                  $$data{get} ne ".." &&
                  $$data{get} =~ /\.([^.]+)$/ &&
-                 -e "files/" . trim($$data{get})) {
-            web("!   %s %s\@web [%s]\n",ts(),$addr,$$data{get});
-            http_reply_simple($s,$1,"FILE",trim($$data{get}));
-         } elsif($$data{get} =~ /\.html$/i && -e "files/".trim($$data{get})) {
+                 -e "txt/" . trim($$data{get})) {
+            web("   %s %s\@web [%s]\n",ts(),$addr,$$data{get});
+            http_reply_simple($s,$1,"%s",getbinfile(trim($$data{get})));
+         } elsif($$data{get} =~ /\.html$/i && -e "txt/" . trim($$data{get})) {
             my $prog = prog($self,$self);                    # uses template
             $$prog{sock} = $s;
             web("   %s %s\@web [%s]\n",ts(),$addr,$$data{get});
@@ -17268,15 +16385,8 @@ sub http_process_line
              }
          }
       }
-   } elsif($txt =~ /Cookie: mstshash=/i) {
-      my $addr = @{@http{$s}}{hostname};
-      $addr = @{@http{$s}}{ip} if($addr =~ /^\s*$/);
-      $addr = $s->peerhost if($addr =~ /^\s*$/);
-      ban_add($s);
-      web("   %s %s\@web [BANNED-%s]\n",ts(),$addr,$1);
-      http_error($s,"%s","BANNED for HACKING");
    } else {
-      web("---BAD REQUEST--- '$txt'\n");
+      printf("---BAD REQUEST--- '$txt'\n");
       http_error($s,"Malformed Request");
    }
 }
@@ -17325,7 +16435,7 @@ sub load_db
       @info{dumps} = ".";
    } else {
       @info{shell} = 0;
-      @info{dumps} = "dumps";
+      @info{dumps} = "data";
    
       if(!-d "@info{dumps}") {
         mkdir(@info{dumps}) || 
@@ -17335,12 +16445,13 @@ sub load_db
       opendir($dir,"@info{dumps}") || 
          die("Unable to find @info{dumps} directory");
 
-      my $fn = (sort grep {/\.tdb$/} readdir($dir))[-1];
+      my $fn=(sort {(stat("@info{dumps}/$a"))[9] <=> 
+                    (stat("@info{dumps}/$b"))[9]}
+              grep {/\.tdb$/}                           # find most current db
+              readdir($dir))[-1];
       closedir($dir);
-  
-      # if in standby mode, db may be complete but a subsquient segment
-      # is partial. Reading archive_logs will resolve this problem 
-      if(!dump_complete("@info{dumps}/$fn") && !@info{standby}) {
+   
+      if(!dump_complete("@info{dumps}/$fn")) {
          die("$fn is incomplete, remove or use --forceload to override");
       }
    
@@ -17351,10 +16462,6 @@ sub load_db
    
       while(<$file>) {
          db_process_line(\%state,$_);
-      
-         # only read the main entry in the db, read archive log for any
-         # other entries.
-         last if(@info{standby} && @state{complete});
       }
       close($file);
    
@@ -17390,101 +16497,21 @@ sub load_db
    }
 
    delete @info{dirty};     # delete, this will get populated by the db load
-
-   cleanup_archived_objects(\%state);
-}
-
-#
-# load_pending_archive_log
-#    When the TeenyMUSH server is a fall over site, the MUSH will load
-#    archive logs (changes) from its parent server to keep the db in sync
-#    with the parent server's db. The max things should be out of date
-#    is 10 minutes.
-# 
-sub load_pending_archive_log
-{
-   my ($dir, %logs);
-
-   my $name = conf("mudname");
-   # find list of pending archive_logs.
-   opendir($dir,"dumps/archive_log") ||
-      logit("Unable to open archive_log directory.");
-
-   for my $fn (readdir($dir)) {
-      if($fn =~ /^$name\.(\d+).al$/i) {
-         @logs{$1+0}="dumps/archive_log/$fn"; # save change# minus leading 0s
-      }
-   }
-   close($dir);
-  
-   # load archive logs in the correct order, show errors every hour.
-   while(defined @logs{change() + 1}) {
-     if(dump_complete(@logs{change()+1})) {
-        my $fn = @logs{change()+1};
-        delete @logs{change()+1};            # don't go into an infinite loop
-        load_archive_log($fn);
-     }
-   }
-}
-
-#
-# load_archive_log
-#    Load the archive log files which contain just the changes since
-#    the last full dump.
-#
-sub load_archive_log
-{
-   my $fn = shift;
-   my %state;
-   my $file;
-   my $last;
-
-   open($file,"< $fn") ||
-      die("Unable to open database '$fn'\n");
-
-   while(<$file>) {
-      s/\r|\n//g;
-      if($_ =~ /^(\d+),([^,]+),{0,1}/) {
-         @state{obj} = $1;
-         my $type = $2;
-         my $rest = $';
-
-         if($type eq "delatr") {
-            my $obj = @db[@state{obj}];
-            delete @$obj{$rest};
-         } elsif($type eq "delobj") {
-            delete @db[@state{obj}];
-         } else {
-            db_process_line(\%state,$rest);
-         }
-      } else {
-         db_process_line(\%state,$_);
-      }
-   }
-
-   if(@state{complete}) {
-      set(obj(0),{},0,"conf.last_archive_log",$fn);
-      printf(" + Read:  %s [%s]\n",$fn,ts());
-   }
-   close($file);
-
-   cleanup_archived_objects(\%state);
 }
 
 sub generic_action
 {
    my ($self,$prog,$target,$action,$target_msg,$src_msg) = @_;
 
-#   printf("%s\n",code("long"));
 #   if((my $atr = get($target,$action)) ne undef) {
-#         echo(self => $self,
-#              prog => $prog,
-#              room => [ $self,
-#                        "%s %s", 
-#                        name($self),
-#                        evaluate($self,$prog,$atr)
-#                      ],
-#             );
+#         necho(self => $self,
+#               prog => $prog,
+#               room => [ $self,
+#                         "%s %s", 
+#                         name($self),
+#                         evaluate($self,$prog,$atr)
+#                       ],
+#         );
 #   }
 
    run_attr($self,$prog,$target,"A$action");           # handle @aACTION
@@ -17497,34 +16524,34 @@ sub generic_action
    my $msg = sprintf($sfmt,@sargs);               # handle msg to enactor
 
    if($msg !~ /^\s*$/) {
-      echo(self =>   $self,
-           prog =>   $prog,
-           source => [ "%s", evaluate($self,$prog,$msg) ],
-           always => 1,
-          );
+      necho(self =>   $self,
+            prog =>   $prog,
+            source => [ "%s", evaluate($self,$prog,$msg) ],
+            always => 1,
+           );
    }
 
    my $atr = get($target,"o$action");
 
    if($atr ne undef) {                                # standard message
-      echo(self =>   $self,
-           prog =>   $prog,
-           room =>   [ $self,
-                       "%s %s",
-                       name($self),
-                       evaluate($self,$prog,$atr)
-                     ],
-           always => 1,
+      necho(self =>   $self,
+            prog =>   $prog,
+            room =>   [ $self,
+                        "%s %s",
+                        name($self),
+                        evaluate($self,$prog,$atr)
+                      ],
+            always => 1,
       );
    } else {                                            # oACTION message
       my ($tfmt,@targs) = @$target_msg;
       my $msg = sprintf($tfmt,@targs);
       if($msg !~ /^\s*$/) {
-         echo(self   =>   $self,
-              prog   =>   $prog,
-              room   => [ $self, "%s %s", name($self), $msg ],
-              always => 1,
-             );
+         necho(self   =>   $self,
+               prog   =>   $prog,
+               room   => [ $self, "%s %s", name($self), $msg ],
+               always => 1,
+              );
       }
    }
 }
@@ -17592,11 +16619,11 @@ sub verify_switches
          } else {
             $name = "N/A";
          }
-         echo(self => $self,
-              prog => $prog,
-              source => [ "Unrecognized switch '%s' for command '%s'",
-                          $key,$name ],
-             );
+         necho(self => $self,
+               prog => $prog,
+               source => [ "Unrecognized switch '%s' for command '%s'",
+                           $key,$name ],
+         );
          return 0;
       }
    }
@@ -17614,11 +16641,10 @@ sub err
    my ($self,$prog,$fmt) = (obj(shift),obj(shift),shift);
    my (@args) = @_;
 
-#   printf("%s\n",print_var($self));
-   echo(self => $self,
-        prog => $prog,
-        source => [ $fmt,@args ],
-       );
+   necho(self => $self,
+         prog => $prog,
+         source => [ $fmt,@args ],
+        );
 
    return 0;
 #   return sprintf($fmt,@args);
@@ -17659,8 +16685,6 @@ sub code
    my $type = shift;
    my @stack;
 
-   return "N/A" if(!module_enabled("carp"));
-
    my $prev = @info{source_prev};
 
    if(!$type || $type eq "short") {
@@ -17683,15 +16707,8 @@ sub code
 
 #
 # renumber_code
-#    When code is reloaded, only the changed subroutines are reloaded
-#    and one by one. This cuts down the re-load time significantly.
-#    The downfall of this is that line numbers returned by shortmess()
-#    will be reset to 1 at the start of every subroutine. Line numbers
-#    directly from shortmess() are now worthless. To get around this
-#    problem, the starting line number of each subroutinue is recorded
-#    and added to the line number of the subroutine returned by shortmess().
-#    This will usually cause the line numbers to be correct as long as
-#    shortmess() is properly parsed.
+#    Look for line number references in the provided text and massage
+#    them into the correct line number.
 #
 sub renumber_code
 {
@@ -17751,7 +16768,7 @@ sub evaluate_substitutions
    my ($out,$seq,$debug);
 
    my $orig = $t;
-   while($t =~ /(\\|%m[0-9]|%q[0-9a-z]|%i[0-9]|%[!psaobrtnk#0-9%]|%(v|w)[a-zA-Z]|%=<[^>]+>|%\{[a-zA-Z0-9\_#]+\}|\$[0-9]|##|#@)/i) {
+   while($t =~ /(\\|%m[0-9]|%q[0-9a-z]|%i[0-9]|%[!psaobrtnk#0-9%]|%(v|w)[a-zA-Z]|%=<[^>]+>|%\{[^}]+\}|\$[0-9]|##|#@)/i) {
       ($seq,$t)=($1,$');                                   # store variables
       $out .= $`;
       if($seq eq "\\") {                               # skip over next char
@@ -17817,8 +16834,6 @@ sub evaluate_substitutions
       } elsif($seq =~ /^\$([0-9])$/i) {
          if(defined $$prog{reg} && defined $$prog{reg}->{$1}) {
             $out .= $$prog{reg}->{$1};
-         } else {
-            $out .= $seq;
          }
       } elsif($seq =~ /^%m([0-9])$/ ||
               $seq =~ /^%\{m([0-9])\}$/) {
@@ -17847,8 +16862,10 @@ sub evaluate_substitutions
          $out .= get($user,$1);
       }
    }
+
    return $out . $t;
 }
+
 
 
 #
@@ -17897,18 +16914,8 @@ sub handle_object_listener
 {
    my ($target,$txt,@args) = @_;
 
-   my $owner = owner($target);
-   if(hasflag($target,"PUPPET") && $$target{obj_id} ne $$owner{obj_id}) {
-      echo_thing({target => [ $target, $txt, @args ],
-                  self   => $owner,
-                  prog   => {}
-                 },
-                 "target",$owner,name($target) . "> ");
-   }
-
    my $parent = get($target,"obj_parent");
 
-   # printf("[$target] $txt\n",@args);
    return if handle_socket_listener($target,$target,$txt,@args);
 
    if($parent ne undef) {                             # handle parent
@@ -17952,7 +16959,7 @@ sub handle_directed_listen
    if($$target{obj_id} == $$self{obj_id} ||
       !hasflag($target,"LISTENER")) {
       return;
-   } 
+   }
 
    for my $hash (sort {length(@{$b}{atr_regexp}) <=>
                        length(@{$a}{atr_regexp})} latr_regexp($target,2)) {
@@ -17960,7 +16967,6 @@ sub handle_directed_listen
       if(atr_case($target,$$hash{atr_name})) {
          $$hash{atr_regexp} =~ s/^\(\?msix/\(\?msx/; # make case sensitive
          if($msg =~ /$$hash{atr_regexp}/) {
-            printf("Matched: '%s@%s'\n",$$target{obj_id},$hash);
             mushrun(self   => $self,
                     runas  => $target,
                     cmd    => single_line($$hash{atr_value}),
@@ -18193,7 +17199,6 @@ sub echo_socket
    my ($obj,$prog,$fmt,@args) = (obj(shift),shift,shift,@_);
 
    my $msg = sprintf($fmt,@args);
-
    $msg = ansi_remove($msg) if !hasflag($obj,"ANSI");
    
    if(defined $$obj{sock} && (!defined $$obj{raw} || $$obj{raw} == 0)) {
@@ -18211,10 +17216,10 @@ sub echo_socket
          defined $$prog{created_by}->{sock} &&                  # have socket
          $$obj{obj_id} == $$prog{created_by}->{obj_id} &&   # going to invoker
          $$prog{cmd}->{source} == 1 &&                      # manually inputed
-         !defined $$prog{always}) {               # to all sockets override
+         !defined $$prog{always}) {                   # to all sockets override
 
-         if(defined @connected{$$prog{created_by}->{sock}} &&
-            @connected{$$prog{created_by}->{sock}}->{type} eq "WEBSOCKET") {
+         if(defined @connected{$$prog{creasted_by}} &&
+            @connected{$$prog{created_by}->{sock}}->{type} eq "WEBSOCK") {
             ws_echo($$prog{created_by}->{sock},ansi_remove($msg));
          } else {
             my $s = $$prog{created_by}->{sock};
@@ -18225,16 +17230,15 @@ sub echo_socket
 
          for my $socket (keys %$list) {
             my $s = $$list{$socket};
-            if(defined @connected{$s} && 
-               @connected{$s}->{type} eq "WEBSOCKET"){
+            if(defined @connected{$s} && @connected{$s}->{type} eq "WEBSOCKET"){
                 ws_echo($s,$msg);
             } else {
                printf($s "%s",$msg);
             }
          }
       }
-   } elsif(hasflag($obj,"PUPPET") && !hasflag($obj,"PLAYER")) { # puppet
-      my $owner = owner($obj);                                  # output
+   } elsif(hasflag($obj,"PUPPET") && !hasflag($obj,"PLAYER")) { # puppet output
+      my $owner = owner($obj);
       if(defined @connected_user{$$owner{obj_id}}) {
          my $list = @connected_user{$$owner{obj_id}};
 
@@ -18251,7 +17255,7 @@ sub echo_socket
    }
 }
 
-sub echo_shell
+sub necho_shell
 {
    my ($self,$arg) = @_;
 
@@ -18265,251 +17269,11 @@ sub echo_shell
    my ($target,$fmt) = (obj(shift(@{$$arg{$type}})), shift(@{$$arg{$type}}));
    return if $$target{obj_id} != 0;
    my $msg = filter_chars(sprintf($fmt,@{$$arg{$type}}));
-   $msg = ansi_remove($msg) if !hasflag($self,"ANSI");
    printf("%s\n",$msg);
-}
-
-#
-# echo_room
-#    Echo something to the contents of a room, usually excluding the
-#    source unless "all_room" is used.
-#
-sub echo_room
-{
-   my ($arg,$type) = @_;
-   
-   my $target = @{$$arg{$type}}[0];
-   my $room = loc($target) || return;
-   my $self = $$arg{self};
-
-   my $array = $$arg{$type};
-   my $fmt = @$array[1];
-   my $msg = sprintf("$fmt",@$array[2 .. $#$array]);
-
-   for my $obj (lcon($room)) {
-      if($$self{obj_id} != $$obj{obj_id} || $type =~ /^all_/) {
-        echo_thing($arg,$type,$obj);
-      }
-   }
-}
-
-#
-# socket_type
-#   Return the socket type of a specified socket.
-#   Valid types are: HTTP, MUSH, WEBSOCKET
-#
-sub socket_type
-{
-   my ($prog,$sock) = @_;
-
-   if(defined @connected{$sock} && defined @connected{$sock}->{type}) {
-      return @connected{$sock}->{type};
-   } elsif(defined @http{$sock}) {
-      return "HTTP";
-   } else {
-      return undef;
-   }
-}
-
-sub socket_list
-{
-   my ($arg,$self,$prog,$target) = (shift,shift,shift,obj(shift));
-   my @list;
-
-   # output directed at target of the program.
-   if(!defined $$arg{always} &&               # hint to go to all sockets?
-#      defined $$prog{created_by} && 
-#      defined $$prog{created_by}->{sock} && 
-#      defined $$prog{created_by}->{sock} && 
-      defined $$prog{sock} &&
-      $$target{obj_id} eq invoker($prog,$self,1)) {
-#      return $$prog{created_by}->{sock};
-      return $$prog{sock};
-   } elsif(!defined @connected_user{$$target{obj_id}}) {
-      return undef;
-   } else {
-      my $list = @connected_user{$$target{obj_id}};
-
-      for my $socket (keys %$list) {
-         push(@list,$$list{$socket});
-      }
-      return @list;
-   }
-   return undef;
-}
-
-
-#
-
-#
-# echo_thing
-#    Echo a message to a thing.
-#
-sub echo_thing
-{
-   my ($arg,$type,$target,$prefix) = @_;
-
-   my $prog = $$arg{prog};
-   my $self = $$arg{self};
-
-   my $array = $$arg{$type};
-
-   my $fmt = @$array[1];
-   my $msg = sprintf("$fmt",@$array[2 .. $#$array]);
-   if(socket_type($prog,$$prog{sock}) eq "HTTP" || 
-      (hasflag($target,"PLAYER") && !hasflag($target,"ANSI"))) {
-      $msg = ansi_remove($msg) if !hasflag($target,"ANSI");
-   }
-#   printf("ECHO THING[%s]: %s\n",$$target{obj_id},$msg);
-
-   if($prefix eq undef) {
-      handle_directed_listen($self,$prog,$target,$msg);
-   }
-
-   # target doesn't want to interact with enactor/$self.
-#   return if(!lock_pass($self,$prog,$target,"OBJ_LOCK_INTERACT"));
-
-   if(defined $$prog{output}) {
-      store_output($self,
-                   $prog,
-                   $target,
-                   socket_type($prog,$$prog{sock}),
-                   $prefix,
-                   $msg
-                  ) && return;
-   } elsif(defined $$prog{output}) {
-      printf("IGnored[%s:%s] %s\n",$type,$$target{obj_id},$msg);
-   }
-
-   
-   if(!loggedin($target)) {
-      # !logged in targets do not get any output ... unless
-      # they just haven't issued a connect command.
-      if($$target{obj_id} == $$self{obj_id} && defined $$self{sock}) {
-         if(socket_type($prog,$$self{sock}) eq "WEBSOCKET") {
-            ws_echo($$self{sock},$prefix.filter_chars($msg));
-         } else {
-            my $sock = $$self{sock};
-
-            if($msg =~ /\n/) {
-               printf($sock "%s",$msg);
-            } else {
-               printf($sock "%s\r\n",$msg);
-            }
-         }
-      }
-   } elsif(hasflag($target,"PLAYER")) {
-      for my $s (socket_list($arg,$self,$prog,$target)) {
-         my $type = socket_type($prog,$s);
-         next if $s eq undef;
-
-         if($type eq "HTTP") {              # http may never get this far?
-            store_output($self,$prog,$target,$type,$prefix,filter_chars($msg));
-         } elsif(!loggedin($target)) {
-            return;
-         } elsif($type eq "WEBSOCKET") {
-            ws_echo($s,$prefix . filter_chars($msg));
-         } else {
-#             printf("SOCK: '$s'\n");
-            printf($s "%s%s",$prefix,filter_chars($msg));
-         }
-      }
-   }
- 
-   # handle puppet output by sending the output to the owner()
-   if(hasflag($target,"PUPPET") && $$target{obj_id} ne owner_id($target)) {
-      echo_thing($arg,$type,owner($target), name($target) . "> ");
-   }
-}
-
-#
-# store_output
-#   @capture and httpd requests need the output from commands stored.
-#   As well, We really only want to capture output that is going to the
-#   object that initiated the $command.
-#
-sub store_output
-{
-   my ($self,$prog,$target,$type,$prefix,$msg) = @_;
-
-   # Store output going to the invoker or when an http connection and the
-   #   invoker is the webuser.
-   # Output from puppets should never be stored. $prefix is our tip off
-   #   that the output is because of the puppet flag.
-   #
-   if($prefix eq undef && 
-      (defined $$prog{nomushrun} ||
-       $$target{obj_id} eq invoker($prog,$self,1) ||
-      ($type eq "HTTP" && invoker($prog,$self,1) eq conf("webuser")))) {
-      $$prog{output} = [] if !defined $$prog{output};
-      push(@{$$prog{output}},filter_chars($msg));
-      return 1;
-   } else {
-#      printf("Do not store(%s,%s,%s): '%s'\n",
-#         $prefix,$$target{obj_id},invoker($prog,$self,1),$msg);
-      return 0;
-   }
-}
-
-#
-# echo
-#   Send information to a connected socket in a standardized format.
-#   $self and $prog should be passed in.
-#
-#   Supported message types:
-#
-#      source    => send output to $self
-#                   fmt: [ "%s", @args ]
-#      room      => send output to everything in the room $target is in
-#                   but not $self. fmt: [ $target, "%s", @args ]
-#      room2     => same thing as room
-#      all_room  => send output to everything in the room $target is in
-#                   (including $self). fmt: [ $target, "%s", @args ]
-#      all_room2 => Same thing as all_room 
-#      target    => Send message to specified target.
-#                   fmt: [ $target, "%s", @args ]
-#
-#    Example: 
-#       echo(self => $self,
-#            prog => $prog,
-#            target => [ $obj, "The room shakes and begins to crumble." ],
-#            room   => [ $obj, "%s has left.", name($obj) ]
-#           );
-sub echo
-{
-   my %arg = @_;
-   my $prog = $arg{prog};
-   my $self = obj($arg{self});
-
-   return echo_shell($self,\%arg) if(@info{shell});
-
-   if(loggedin($self)) {
-     # skip checks for non-connected players
-   } elsif(!defined $arg{self}) {             # checked passed in arguments
-      err($self,$prog,"Echo expects a self argument passed in");
-   } elsif(!defined $arg{prog}) {
-      err($self,$prog,"Echo expects a prog argument passed in");
-   }
-
-   # fill in "source" target to make code simplier.
-   unshift(@{$arg{source}},$self) if(defined $arg{source}); 
-
-   # process all message types
-   for my $type ("source","target","room","room2","all_room","all_room2") {
-      if(defined $arg{$type}) {
-         if($type =~ /room/) {
-            echo_room(\%arg,$type);
-         } else {
-            echo_thing(\%arg,$type,@{@arg{$type}}[0]);
-         }
-      }
-   }
 }
 
 sub necho
 {
-#   return echo(@_);
-
    my %arg = @_;
    my $prog = $arg{prog};
    my $self = obj($arg{self});
@@ -18567,7 +17331,14 @@ sub necho
       }
    }
 
-   unshift(@{$arg{source}},$self) if(defined $arg{"source"});
+   if(defined $arg{"source"}) {
+         unshift(@{$arg{source}},$self);
+#      if(defined $$prog{created_by}) {
+#         unshift(@{$arg{source}},$$prog{created_by});
+#      } else {
+#         unshift(@{$arg{source}},$self);
+#      }
+   }
 
    for my $type ("source", "target") {
       next if !defined $arg{$type};
@@ -18663,10 +17434,6 @@ sub necho
    }
 }
 
-#
-# echo_flag
-#    Send a message to every connected player with a the specified flags.
-#
 sub echo_flag
 {
    my ($self,$prog,$flags,$fmt,@args) = @_;
@@ -18695,10 +17462,6 @@ sub echo_flag
    }
 }
 
-#
-# connected_user
-#   Return the socket for a connected user. Shouldn't this be sockets?
-#
 sub connected_user
 {
    my $target = shift;
@@ -18715,13 +17478,10 @@ sub connected_user
    return undef;
 }
 
-#
-# loggedin
-#   Is the $target logged into the mush or not.
-#
 sub loggedin
 {
    my $target = obj(shift);
+
 
    if(defined $$target{obj_id} &&
       defined @connected_user{$$target{obj_id}}) {
@@ -18731,11 +17491,6 @@ sub loggedin
    }
 }
 
-#
-# valid_dbref
-#    Return if a dbref is valid or not. This is complicated by if the
-#    MUSH is in "backup" mode or not.
-#
 sub valid_dbref
 {
    my ($id,$no_check_bad) = (shift,shift);
@@ -18764,10 +17519,6 @@ sub valid_dbref
    }
 }
 
-#
-# owner_id
-#    Return the dbref of the owner of a particular object.
-#
 sub owner_id
 {
 
@@ -18796,7 +17547,7 @@ sub set_flag
    }
 
    if(!is_flag($flag)) {
-      return "I don't understand that flag. '$flag'" . code();
+      return "I don't understand that flag. " . code();
    }
 
    if($flag =~ /^\s*!\s*/) {
@@ -18848,12 +17599,6 @@ sub set_atr_flag
    }
 }
 
-#
-# first_room
-#   Return the first room in the database when starting at dbref #0 and going
-#   up. This is ment to be used only when the mush can't figure out where
-#   to logically put something.
-#
 sub first_room
 {
    my $skip = shift;
@@ -18887,11 +17632,11 @@ sub destroy_object
    for my $obj (lcon($target)) {             # move objects out of the way
       my $home = home($obj);
 
-      echo(self => $self,
-           prog => $prog,
-           target => [ $obj, "The room shakes and begins to crumble." ],
-           room   => [ $obj, "%s has left.", name($obj) ]
-          );
+      necho(self => $self,
+            prog => $prog,
+            target => [ $obj, "The room shakes and begins to crumble." ],
+            room   => [ $obj, "%s has left.", name($obj) ]
+           );
 
       # default to first room if home can't be determined.
       if($home eq undef || $home == $$target{obj_id}) {
@@ -18907,11 +17652,11 @@ sub destroy_object
       my $loc = loc($target);                        # remove from location
       db_remove_list($loc,"obj_content",$$target{obj_id});
       db_remove_list($loc,"obj_exits",$$target{obj_id});
-      echo(self    => $self,
-           prog    => $prog,
-           all_room    =>  [ $target, "%s was destroyed.", name($target) ],
-           all_room2   => [ $target, "%s has left.", name($target) ]
-          );
+      necho(self    => $self,
+            prog    => $prog,
+            all_room    =>  [ $target, "%s was destroyed.", name($target) ],
+            all_room2   => [ $target, "%s has left.", name($target) ]
+           );
    }
 
    push(@free,$$target{obj_id});
@@ -18924,10 +17669,6 @@ sub destroy_object
    return 1;
 }
 
-#
-# create_object
-#    Create a generic object that could be a player, room, or something else.
-#
 sub create_object
 {
    my ($self,$prog,$name,$pass,$type,$flag) = @_;
@@ -18968,10 +17709,10 @@ sub create_object
    set_flag($self,$prog,$id,"NO_COMMAND",1);
 
    if($out =~ /^#-1 /) {
-      echo(self => $self,
-           prog => $prog,
-           source => [ "%s", $out ]
-          );
+      necho(self => $self,
+            prog => $prog,
+            source => [ "%s", $out ]
+           );
       db_delete($id);
       push(@free,$id);
       return undef;
@@ -18979,7 +17720,6 @@ sub create_object
 
    if($type eq "PLAYER") {
       db_set($id,"obj_lock_default","#" . $id);
-      db_set($id,"obj_lock_enter","#" . $id);
       db_set($id,"obj_home",$where);
       db_set($id,"obj_money",conf("starting_money"));
       db_set($id,"obj_firstsite",$where);
@@ -18987,8 +17727,6 @@ sub create_object
       @player{trim(ansi_remove(lc($name)))} = $id;
    } else {
       db_set($id,"obj_home",$$self{obj_id});
-      db_set($id,"obj_lock_default","#" . $id);
-      db_set($id,"obj_lock_enter","#" . $id);
    }
 
    db_set($id,"obj_owner",$owner);
@@ -19058,65 +17796,7 @@ sub print_var
    return $out;
 }
 
-sub depth
-{
-   return "  " x $_[0];
-}
 
-sub show
-{
-   my ($var,$ignore,$d,$name,$hist) = @_;
-   $hist = {} if $hist eq undef;
-   my $max = 7;
-   my $out;
-
-   if($name eq undef) {
-      if(ref($var) eq undef) {
-         $name = "STRING";
-      } else {
-         $name = ref($var);
-      }
-   }
-   return if(ref($ignore) eq "HASH" && defined $$ignore{$name});
-
-   if(ref($var) eq "HASH") {
-      if($d >= $max) {
-         $out .= depth($d) . $name . " { TO_BIG }\n";
-      } elsif(scalar keys %$var == 0) {
-         $out .= depth($d) . $name . " { EMPTY_HASH }\n";
-      } elsif(defined $$hist{$var}) {
-         $out .= depth($d) . $name . " { HASH_DUPLICATE }\n";
-      } else {
-         $$hist{$var} = $name if(!defined $$hist{$var});
-         $out .= depth($d) . $name . "[$var] {\n";
-         for my $key (sort keys %$var) {
-            $out .= show($$var{$key},$ignore,$d+1,$key,$hist);
-         }
-         $out .= depth($d) . "}\n";
-      }
-   } elsif(ref($var) eq "ARRAY") {
-      if($#$var == -1) {
-         $out .= depth($d) . $name . " { EMPTY_ARRAY }\n";
-      } else {
-         $out .= depth($d) . $name . " [\n";
-         for my $i (0 .. $#$var) {
-             $out .= show($$var[$i],$ignore,$d+1,$i,$hist);
-         }
-         $out .= depth($d) . "]\n";
-      }
-   } else {
-      $out .= depth($d) . $name . " : " . $var . "\n";
-   }
-   return  $out;
-}
-
-
-
-#
-# inuse_player_name
-#    Check to see if a name is in use. @player should contain a list
-#    of all players.
-#
 sub inuse_player_name
 {
    my ($name,$self) = @_;
@@ -19155,26 +17835,23 @@ sub give_money
 }
 
 #
-# good_atr_name
-#    Generic function to return if an attribute name is good or not.
+# set_used_quota
+#    Update how much quota has been used by $obj
 #
+
 sub good_atr_name
 {
    my ($attr,$flag) = @_;
 
    if(reserved($attr) && !$flag) {                     # don't set that!
       return 0;
-   } elsif($attr =~ /^\s*([#a-zA-Z0-9\_\-\.\/\\\+]+)\s*$/i) {
+   } elsif($attr =~ /^\s*([#a-z0-9\_\-\.\/\\++]+)\s*$/i) {
       return 1;
    } else {
       return 0;
    }
 }
 
-#
-# set
-#    Set an attribute on an object.
-#
 sub set
 {
    my ($self,$prog,$obj,$attribute,$value,$quiet,$override)=
@@ -19190,26 +17867,22 @@ sub set
    } elsif($value =~ /^\s*$/) {                           # delete attribute
       db_set($obj,$attribute,undef);
       if(!$quiet) {
-          echo(self => $self,
-               prog => $prog,
-               source => [ "Set." ]
-              );
+          necho(self => $self,
+                prog => $prog,
+                source => [ "Set." ]
+            );
       }
    } else {                                                  # set attribute
       db_set($obj,$attribute,$value);
       if(!$quiet) {
-          echo(self => $self,
-               prog => $prog,
-               source => [ "Set." ]
-              );
+          necho(self => $self,
+                prog => $prog,
+                source => [ "Set." ]
+               );
       }
    }
 }
 
-#
-# subget
-#    Set an attribute on a hashtable contained inside an attribute.
-#
 sub subget
 {
    my ($attr,$debug) = @_;
@@ -19256,15 +17929,6 @@ sub module_enabled
        return 0;
     }
 }
-
-sub has_conf
-{
-   my $conf = shift;
-
-   return hasattr(0,"CONF.$conf") ? 1 : 0;
-}
-
-
 #
 # conf
 #    Grab a configuration option from off of "#0/conf.name" or the @default
@@ -19279,8 +17943,6 @@ sub conf
 
    if($_[0] eq "version") {
       return version();
-   } elsif(@info{standby} && defined @info{"conf.$_[0]"}) {
-      return @info{"conf.$_[0]"};
    } elsif(hasattr(obj(0),"conf.$_[0]")) {
       $attr = get(obj(0),"conf." . $_[0]);
    } elsif(defined @default{lc($_[0])}) {             # use @defaults?
@@ -19296,19 +17958,11 @@ sub conf
    }
 }
 
-#
-# conf_true
-#    Quick test to see if the contents of a config variable is true or not.
-#
 sub conf_true
 {
    return is_true(conf($_[0]));
 }
 
-#
-# get
-#    Get the contents of an attribute.
-#
 sub get
 {
    my ($obj,$attribute,$flag) = (obj($_[0]),$_[1],$_[2]);
@@ -19320,21 +17974,18 @@ sub get
    return $attr;
 }
 
-#
-# loc
-#    Return the dbref of an object
-#
 sub loc
 {
    my $loc = loc_obj($_[0]);
    return ($loc eq undef) ? undef : $$loc{obj_id};
 }
 
-#
-# obj_name
-#    Return the object name. Dbref and flags are returned if the calling
-#    object controls the object in question.
-#
+sub player
+{
+   my $obj = shift;
+   return hasflag($obj,"PLAYER");
+}
+
 sub obj_name
 {
    my ($self,$obj,$flag,$noansi) = (obj(shift),shift,shift,shift);
@@ -19416,14 +18067,6 @@ sub teleport
    return 1;
 }
 
-#
-# obj
-#    This function should probably go away. Its a hold over from when
-#    the mush used a mysql database. This would fix some of the problems
-#    called when the data was coming from the database or the memory
-#    database. Now the code should just use the dbref of the object instead
-#    of an hash table containing the object.
-#
 sub obj
 {
    my $id = shift;
@@ -19717,11 +18360,6 @@ sub lock_item_eval
       $not = ($1 eq "!") ? 1 : 0;
       $target = find($obj,$prog,$2);
 
-      echo(self   => $self,
-           prog   => $prog,
-           source => [ "item %s",$item ]
-          );
-
       if($target eq undef) {                             # verify item exists
          return lock_error($lock,"Target($2) does not exist.");
       } elsif(($not && $$target{obj_id} ne $$self{obj_id}) ||   # compare item
@@ -19773,26 +18411,6 @@ sub lock_eval
     return $lock;
 }
 
-sub lock_pass
-{
-   my ($self,$prog,$target,$type) = @_;
-
-   printf("GOT THIS FAR: 1\n");
-   my $atr = get($target,$type);
-   printf("GOT THIS FAR: 2\n");
-
-   if($atr ne undef) {
-      printf("GOT THIS FAR: 3 [$atr]\n");
-      my $lock = lock_eval($self,$prog,$target,$atr);
-      printf("GOT THIS FAR: 4\n");
-
-      printf("RETURN: 0\n") if($$lock{error} || !$$lock{result});
-      return 0 if($$lock{error} || !$$lock{result});
-   }
-      printf("RETURN: 1\n");
-   return 1;
-}
-
 #
 # lock_item_compile
 #    Each item is a comparison against the object trying to pass throught the
@@ -19833,7 +18451,7 @@ sub lock_item_compile
       $target = find($obj,$prog,$txt);
 
       if($target eq undef) {                             # verify item exists
-         return lock_error($lock,"TargeT($obj) does not exist");
+         return lock_error($lock,"Target($obj) does not exist");
       } elsif($flag) {
          push(@$array,"$not" . obj_name($self,$target));
       } else {
@@ -20059,7 +18677,6 @@ sub server_process_line
 
    if(defined $$data{raw} && $$data{raw} == 1) {
       $input =~ s/\r//mg;
-      $input =~ tr/\x80-\xFF//d;                        # strip control chars
       handle_object_listener($data,"%s",$input);
    } elsif(defined $$data{raw} && $$data{raw} == 2) {
       $input =~ s/\r//mg;
@@ -20074,7 +18691,6 @@ sub server_process_line
 
          if($input =~ /^\s*([^ ]+)/ || $input =~ /^\s*$/) {
             $user = $hash;
-            my ($in,$rest) = ($1,$');
             if(loggedin($hash) ||
                     (defined $$hash{obj_id} && hasflag($hash,"OBJECT"))) {
                add_last_info($input);                                   #logit
@@ -20085,15 +18701,10 @@ sub server_process_line
                               cmd    => $input,
                              );
             } else {
-               if(conf("show_offline_cmd") && 
-                  $input !~ /^\s*(\@remotehostname|connect)/i) {
-                  my $ignore = conf("host_filter");
-                  if($ignore eq undef ||
-                     !inlist($$hash{hostname},split(/,/,$ignore))) {
-                     con("[%s:%s] %s <Offline>\n",ts(),$$hash{hostname},$input);
-                  }
+               if(conf("show_offline_cmd")) {
+                  con("[%s:%s] %s <Offline>\n",ts(),$$hash{hostname},$input);
                }
-               my ($cmd,$arg) = lookup_command($data,\%offline,$in,$rest,0);
+               my ($cmd,$arg) = lookup_command($data,\%offline,$1,$',0);
                &{@offline{$cmd}}($hash,prog($user,$user),$arg);  # invoke cmd
             }
          }
@@ -20108,15 +18719,15 @@ sub server_process_line
          } else {
             $msg = sprintf("%s crashed the server with: %s",name($hash),$_[1]);
          }
-         echo(self   => $hash,
-              prog   => prog($hash,$hash),
-              source => [ "%s",$msg ]
-             );
+         necho(self   => $hash,
+               prog   => prog($hash,$hash),
+               source => [ "%s",$msg ]
+              );
          if($msg ne $$user{crash}) {
-            echo(self   => $hash,
-                 prog   => prog($hash,$hash),
-                 room   => [ $hash, "%s",$msg ]
-                );
+            necho(self   => $hash,
+                  prog   => prog($hash,$hash),
+                  room   => [ $hash, "%s",$msg ]
+                 );
             $$user{crash} = $msg;
          }
          delete @$hash{buf};
@@ -20136,7 +18747,7 @@ sub server_hostname
 
    my $name = gethostbyaddr(inet_aton($ip),AF_INET);
 
-   if($name =~ /^\s*$/ || $name =~ /in-addr\.arpa$/) {
+   if($name eq undef || $name =~ /in-addr\.arpa$/) {
       return $ip;                            # last resort, return ip address
    } else {
       return $name;                                         # return hostname
@@ -20161,6 +18772,7 @@ sub get_free_port
 
    return $i;                                        # should never happen
 }
+
 
 #
 # server_handle_sockets
@@ -20228,8 +18840,7 @@ sub server_handle_sockets
                   my $obj = obj(0);            #  show login in readonly mode
                   my $prog = prog($obj,$obj,$obj);
                   $$prog{read_only} = 1;
-                  printf($new "%s",
-                     add_return(mush_eval($obj,$prog,conf("login"))));
+                  printf($new "%s\r\n",evaluate($obj,$prog,conf("login")));
                }
             }
          } elsif(sysread($s,$buf,1024) <= 0) {          # socket disconnected
@@ -20254,6 +18865,15 @@ sub server_handle_sockets
 #                     @info{connected_raw_socket} = $s;
 #                  }
 #                  @info{connected_raw} .= $` . "\n";
+#               }
+
+#               if(!defined @connected{$s}) {
+#                  printf("## no socket??? '$s'\n");
+#               } elsif(@{@connected{$s}}{raw} > 0) {
+#                  my $tmp = $`;
+#                  $tmp =~ s/\e\[[\d;]*[a-zA-Z]//g;
+#                  printf("#%s# %s\n",@{@connected{$s}}{raw},$tmp);
+#               }
             }
          }
       }
@@ -20268,7 +18888,6 @@ sub server_handle_sockets
    }
 }
 
-
 #
 # server_disconnect
 #    Either the user has QUIT or disconnected, so handle the disconnect
@@ -20277,7 +18896,7 @@ sub server_handle_sockets
 sub server_disconnect
 {
    my $id = shift;
-   my ($prog, $type, $disconnected);
+   my ($prog, $type);
 
    calculate_login_stats();
 
@@ -20320,21 +18939,13 @@ sub server_disconnect
          if($$hash{buf} !~ /^\s*$/) {
             server_process_line($hash,$$hash{buf});    # process pending line
          }                                                   # needed for www
-         echo(self => $hash,
-              prog => $prog,
-              "[ Connection closed ]"
-             );
+         necho(self => $hash,
+               prog => $prog,
+               "[ Connection closed ]"
+              );
       } elsif(defined $$hash{connect_time}) {                # Player Socket
 
          my $key = connected_user($hash);
-
-         if(!defined $$hash{obj_id} || 
-            !defined @connected_user{$$hash{obj_id}} ||
-            scalar keys %{@connected_user{$$hash{obj_id}}} <= 1) {
-            $disconnected = "disconnected";
-         } else {
-            $disconnected = "partially disconnected";
-         }
 
          if(defined @connected_user{$$hash{obj_id}}) {
             delete @{@connected_user{$$hash{obj_id}}}{$key};
@@ -20343,17 +18954,19 @@ sub server_disconnect
             }
          }
 
+#         necho(self => $hash,
+#               prog => $prog,
+#               room => [ $hash, "%s has disconnected.",name($hash) ]
+#              );
          generic_action($hash,
                         $prog,
                         $hash,
                         "disconnect",
-                        [ "has $disconnected." ],
+                        [ "has disconnected." ],
                         [ "" ]);
 
-         if(!hasflag($hash,"NOMONITOR")) {
-            echo_flag($hash,$prog,"CONNECTED,PLAYER,MONITOR",
-                      "[Monitor] %s has $disconnected.",name($hash));
-         }
+         echo_flag($hash,$prog,"CONNECTED,PLAYER,MONITOR",
+                   "[Monitor] %s has disconnected.",name($hash));
       }
    }
 
@@ -20384,39 +18997,12 @@ sub server_start
    my @port;
    my @tried;
 
-   @info{initial_load_done} = 1;
-
-
-   #
-   # init websocket connection first as this is the most important
-   # connection as it will handle the listeners for all sockets if
-   # enabled.
-   # 
-   if(module_enabled("websocket") && conf("websocket") > 0 &&
-      module_enabled("timeout")) {
-      if(conf("websocket") =~ /^\s*(\d+)\s*$/) {
-         push(@port,conf("websocket") . "{websocket}");
-         websock_init();
-      } else {
-         con("Invalid websocket port number specified in #0/conf.websocket");
-      }
-   } else {                                       # emulate websocket listener
-      $ws = {};                                              # when not in use
-      $ws->{select_readable} = IO::Select->new();
-   }
-
-
-   #
-   # Now the listener for the mush itself, A list is supported to allow a
-   # second instance to fire up an alternate port. Most people won't want
-   # this.
-   #
+   # my dev instant just needs a free port, so choose from a list
    for my $p (split(/,/,conf("port"))) {
       $listener = IO::Socket::INET->new(LocalPort => $p,
                                         Listen    => 1,
                                         Reuse     => 1
-         ) or die "failed to listen: $!";
-      $ws->{select_readable}->add($listener);
+                                       );
       if($listener ne undef) {
          push(@port,"$p\{Mush\}");
          last;
@@ -20426,41 +19012,42 @@ sub server_start
    }
    die("Ports " . join(',',@tried) . " already in use.") if $listener eq undef;
 
-   # 
-   # now http/https listener
    # uri_escape is required for httpd
-   #
-   if(has_conf("http") && module_enabled("uri_escape")) {
-      if(conf("http") eq undef) {
-         # do nothing
-      } elsif(conf("http") !~ /^\s*(\d+)\s*$/) {
-         con("Invalid http port specified in #0/conf.http");
-      } elsif(conf_true("http_secure")) {
-         push(@port,conf("http") . "{https}");
-         $web = IO::Socket::SSL->can_ipv6->new(Listen             => 5,
-                                      LocalPort          => conf("http"),
-                                      Proto              => 'tcp',
-                                      SSL_cert_file      => "cert.pem",
-                                      SSL_key_file       => "key.pem",
-         ) or die "failed to https_listen on " . conf("http") . " : $!";
-         IO::Socket::Timeout->enable_timeouts_on($web);
-         $web->read_timeout(.7);
-         $web->write_timeout(.7);
-         $ws->{select_readable}->add($web);
-      } else {
-         push(@port,conf("http") . "{http}");
+   if(!module_enabled("uri_escape") && conf("httpd") > 0) {
+      con("httpd disabled because of missing URI::Escape module");
+   } elsif(module_enabled("uri_escape") && conf("httpd") > 0) {
+      if(conf("httpd") =~ /^\s*(\d+)\s*$/) {
+         push(@port,conf("httpd") . "{httpd}");
 
-         $web = IO::Socket::INET->new(LocalPort => conf("http"),
+         $web = IO::Socket::INET->new(LocalPort => conf("httpd"),
                                       Listen    =>1,
                                       Reuse     =>1
-         ) or die "failed to http_listen: $!";
-         $ws->{select_readable}->add($web);
+                                     );
+      } else {
+         con("Invalid httpd port number specified in #0/conf.httpd");
       }
    }
 
+   if(module_enabled("websocket") ne undef && conf("websocket") > 0) {
+      if(conf("websocket") =~ /^\s*(\d+)\s*$/) {
+         push(@port,conf("websocket") . "{websocket}");
+         websock_init();
+      } else {
+         con("Invalid websocket port number specified in #0/conf.websocket");
+      }
+   }
    @info{initial_load_done} = 1;
+
+   if($ws eq undef) {                             # emulate websocket listener
+      $ws = {};                                              # when not in use
+      $ws->{select_readable} = IO::Select->new();
+   }
+
    $ws->{select_readable}->add($listener);
 
+   if(conf("httpd") ne undef) {
+      $ws->{select_readable}->add($web);
+   }
    $readable = $ws->{select_readable};
    printf(" + Listening on ports: %s\n",join(',',@port));
 
@@ -20499,29 +19086,13 @@ sub server_start
 
 sub websock_init
 {
-   if(conf_true("http_secure")) {
-      $websock = IO::Socket::SSL->can_ipv6->new(Listen             => 5,
-                                      LocalPort          => conf("websocket"),
-                                      Proto              => 'tcp',
-                                      SSL_startHandshake => 0,
-                                      SSL_cert_file      => "cert.pem",
-                                      SSL_key_file       => "key.pem",
-                                      timeout            => .1,
-      ) or die "failed to ws_listen: $!";
-      IO::Socket::Timeout->enable_timeouts_on($websock);
-      $websock->read_timeout(.7);
-      $websock->write_timeout(.7);
-
-
-   } else {
-      $websock = IO::Socket::INET->new( Listen    => 5,
-                                        LocalPort => conf("websocket"),
-                                        Proto     => 'tcp',
-                                        Domain    => AF_INET,
-                                        ReuseAddr => 1,
-                                      )
-      or die "failed to set up TCP listener: $!";
-   }
+   $websock = IO::Socket::INET->new( Listen    => 5,
+                                     LocalPort => conf("websocket"),
+                                     Proto     => 'tcp',
+                                     Domain    => AF_INET,
+                                     ReuseAddr => 1,
+                                   )
+   or die "failed to set up TCP listener: $!";
 
    $ws = Net::WebSocket::Server->new(
       listen => $websock,
@@ -20547,24 +19118,11 @@ sub ws_disconnect
     delete $ws->{conns}{$sock};
 }
 
-sub add_return
-{
-   if(@_[0] =~ /\n$/) {
-      return @_[0];
-   } else {
-      return @_[0] . "\r\n";
-   }
-}
-
 sub ws_login_screen
 {
    my $conn = shift;
 
-   # setup fake $prog variable
-   my $prog = prog(obj(0),obj(0),obj(0));
-   $$prog{read_only} = 1;
-
-   ws_echo($conn->{socket},add_return(mush_eval(obj(0),$prog,conf("login"))));
+   ws_echo($conn->{socket}, conf("login"));
 }
 
 #
@@ -20584,16 +19142,7 @@ sub ws_echo
    # probably be removed once this is more stable. With that in mind,
    # currently crash will be treated as a disconnect.
    eval {
-      while(defined $msg) {
-         my $txt = substr($msg,0,1000);
-         if($txt =~ /\n([^\n]+)$/s && length($`) > 900) {
-            $conn->send('','t'.$`."\n");
-            $msg = $1 . substr($msg,1000);
-         } else {
-            $conn->send('','t'.$txt);
-            $msg = substr($msg,1000);
-         }
-      }
+      $conn->send('','t'.$msg);
    };
 
    if($@) {
@@ -20608,22 +19157,6 @@ sub websock_io
 
    if( $sock == $ws->{listen} ) {
       my $sock = $ws->{listen}->accept;
-      next unless $sock;
-
-      if(conf_true("http_secure")) {
-         IO::Socket::SSL->start_SSL(
-             $sock,
-             SSL_server    => 1,
-             SSL_cert_file => "cert.pem",
-             SSL_key_file  => "key.pem",
-         ) or do {
-            my $addr = server_hostname($sock);
-            web("   %s %s\@web [timeout]\n",ts(),$addr);
-            $sock->close;
-            return;
-         }
-      }
-
       my $conn = new Net::WebSocket::Server::Connection(
                  socket => $sock, server => $ws );
 
@@ -21046,11 +19579,300 @@ sub db_read_import
 
    post_db_read_fix($start);
 
-   echo(self   => $self,
-        prog   => $prog,
-        source => [ "Import starts at object $start\n" . 
-                    "Objects Imported: %s",$#db - $start ]
-       );
+   necho(self   => $self,
+         prog   => $prog,
+         source => [ "Import starts at object $start" ]
+        );
+   necho(self   => $self,
+         prog   => $prog,
+         source => [ "    Objects Imported: %s",$#db - $start ]
+        );
 }
 
 main();                                                  #!# run only once
+
+__END__
+obj[0] {
+   obj_content:1594701540:1596661505::L:0,5
+   obj_created_date:1594699086:1594699086::A:Mon Jul 13 22:58:06 2020
+   obj_flag:1594699086:1594701459::L:compat,no_command,god,player,wizard
+   obj_home:1594699173:1594699173::A:1
+   obj_last_inhabited:1594699086:1596661505::A:Wed Aug  5 16:05:05 2020
+   obj_lastsite:1597540609:1597540609::H:1594732275:A:1594732827,1,localhost;1594701763:A:1594701763,1,localhost;1594701665:A:1594701665,1,localhost;1594701532:A:1594701532,1,localhost;1594701432:A:1594701494,1,localhost;1594699536:A:1594699536,1,localhost;1594699151:A:1594699224,1,localhost
+   obj_location:1594699086:1596661505::A:0
+   obj_lock_default:1594699086:1594699086::A:#0
+   obj_money:1594699151:1594732775::A:310
+   obj_name:1594699086:1594699086::A:god
+   obj_owner:1594699086:1594699086::A:0
+   obj_password:1594699086:1594699086::A:*EF5D6D678BAE641D8DAF107523B0EA48D420E0E0
+   obj_quota:1594699086:1596145367::A:1000,3
+   bb_read:1594733047:1596124118::A:1
+   conf.mudname:1596125110:1596125110::A:MyrddinBBS
+   conf.port:1594699086:1594699086::A:4201
+   conf.starting_room:1594699086:1594699086::A:#1
+   conf.webobject:1594699086:1594699086::A:#3
+   conf.webuser:1594699086:1594699086::A:#2
+   dbref_bbpocket:1594701540:1594732685::A:#4
+   dbref_bbs:1594701540:1594732685::A:#5
+   foo:1597540594:1597540609::A:bar
+   test:1594732817:1594732817::A:Foo
+}
+obj[1] {
+   obj_content:1594699086:1596661495::L:2
+   obj_created_date:1594699086:1594699086::A:Mon Jul 13 22:58:06 2020
+   obj_flag:1594699086:1594699086::L:room,no_command
+   obj_home:1594699086:1594699086::A:0
+   obj_last_inhabited:1594699086:1596661505::A:Wed Aug  5 16:05:05 2020
+   obj_name:1594699086:1594699086::A:The Void
+   obj_owner:1594699086:1594699086::A:0
+}
+obj[2] {
+   obj_content:1594699086:1594699086::L:3
+   obj_created_date:1594699086:1594699086::A:Mon Jul 13 22:58:06 2020
+   obj_firstsite:1594699086:1594699086::A:1
+   obj_flag:1594699086:1594699086::L:player,no_command
+   obj_home:1594699086:1594699086::A:1
+   obj_last_inhabited:1594699086:1594699086::A:Mon Jul 13 22:58:06 2020
+   obj_location:1594699086:1594699086::A:1
+   obj_lock_default:1594699086:1594699086::A:#2
+   obj_money:1594732362:1594732362::A:150
+   obj_name:1594699086:1594699086::A:webuser
+   obj_owner:1594699086:1594699086::A:0
+   obj_password:1594699086:1594699086::A:*EF5D6D678BAE641D8DAF107523B0EA48D420E0E0
+   obj_quota:1594699086:1594732362::A:0,1
+}
+obj[3] {
+   obj_created_date:1594699086:1594699086::A:Mon Jul 13 22:58:06 2020
+   obj_flag:1594699086:1594699086::L:object
+   obj_home:1594699086:1594699086::A:2
+   obj_last_inhabited:1594699086:1594699086::A:Mon Jul 13 22:58:06 2020
+   obj_location:1594699086:1594699086::A:2
+   obj_name:1594699086:1594699086::A:WebSecurityObject
+   obj_owner:1594699086:1594699086::A:2
+   default:1594699086:1594699086::A:$default:@pemit %#=This is the minimal default web page for [version()]. Please update this with: &default #3=Your web page
+}
+obj[4] {
+   obj_created_by:1594732685:1594732685::A:localhost
+   obj_created_date:1594732685:1594732685::A:Tue Jul 14 08:18:05 2020
+   obj_flag:1594732685:1594732685::L:no_command,object
+   obj_home:1594732685:1594732685::A:0
+   obj_last_inhabited:1594732685:1594732688::A:Tue Jul 14 08:18:08 2020
+   obj_location:1594732685:1594732688::A:5
+   obj_money:1594732685:1594732685::A:10
+   obj_name:1594732685:1594732685::A:bbpocket
+   obj_owner:1594732685:1594732685::A:0
+   _myrbb_version:1594732685:1594732685::A:5.0.0
+   addem:1594732685:1594732685::A:add(%0,%1)
+   b36_digits:1594732685:1594732685::A:0 1 2 3 4 5 6 7 8 9 A B C D E F G H I J K L M N O P Q R S T U V W X Y Z
+   b36_pows:1594732685:1594732685::A:1 36 1296 46656 1679616 60466176
+   bbtime:1594732685:1594732685::A:secs()
+   bbtime_view:1594732685:1594732685::A:ifelse(isnum(%0),ldelete(convsecs(%0),4),%0)
+   bbtime_view_details:1594732685:1594732685::A:ifelse(isnum(%0),convsecs(%0),%0)
+   buffer_size:1594732685:1594732685::A:0
+   c:1594732685:1594732685::A:switch([v(DO_COLOR)]:[hasattr(%#,_C_%0)],1:1,ulocal(%#/_C_%0,%1),1:0,ulocal(C_%0,%1),%1)
+   c_1:1594732685:1594732685::A:ansi(bh,%0)
+   c_2:1594732685:1594732685::A:ansi(gh,%0)
+   c_3:1594732685:1594732685::A:ansi(ch,%0)
+   c_staff:1594732685:1594732685::A:ansi(mh,%0)
+   c_theme:1594732685:1594732685::A:bright
+   c_timeout:1594732685:1594732685::A:ansi(y,%0)
+   c_unread:1594732685:1594732685::A:ansi(g,%0)
+   color_themes:1594732685:1594732685::A:subtle:bright:carnival:dreaming
+   config_timeout:1594732685:1594732685::A:2592000
+   ct_bright:1594732685:1594732685::A:Light, bright colors.
+   ct_bright_1:1594732685:1594732685::A:ansi(bh,%0)
+   ct_bright_2:1594732685:1594732685::A:ansi(gh,%0)
+   ct_bright_3:1594732685:1594732685::A:ansi(ch,%0)
+   ct_bright_staff:1594732685:1594732685::A:ansi(mh,%0)
+   ct_bright_timeout:1594732685:1594732685::A:ansi(y,%0)
+   ct_bright_unread:1594732685:1594732685::A:ansi(g,%0)
+   ct_carnival:1594732685:1594732685::A:[setq(M,Extra flag required for proper colors)][switch(version(),Tiny*,Colortheme 'carnival' will not work on TinyMUSH,Rhost*,ifelse(hasflag(%#,setr(F,XTERMCOLOR)),You already have the %qF flag set.  Good.,%qM: @set me=%qF),MUX*,ifelse(hasflag(%#,setr(F,COLOR256)),You already have the %qF flag set.  Good.,%qM: @set me=%qF),Penn*,ifelse(hasflag(%#,setr(F,XTERM256)),You already have the %qF flag set.  Good.,%qM: @set me=%qF))]
+   ct_carnival_1:1594732685:1594732685::A:ansi(<#ff0087>,%0)
+   ct_carnival_2:1594732685:1594732685::A:ansi(c,%0)
+   ct_carnival_3:1594732685:1594732685::A:ansi(bh,%0)
+   ct_carnival_staff:1594732685:1594732685::A:ansi(mh,%0)
+   ct_carnival_timeout:1594732685:1594732685::A:ansi(y,%0)
+   ct_carnival_unread:1594732685:1594732685::A:ansi(g,%0)
+   ct_dreaming:1594732685:1594732685::A:[setq(M,Extra flag required for proper colors)][switch(version(),Tiny*,Colortheme 'dreaming' will not work on TinyMUSH,Rhost*,ifelse(hasflag(%#,setr(F,XTERMCOLOR)),You already have the %qF flag set.  Good.,%qM: @set me=%qF),MUX*,ifelse(hasflag(%#,setr(F,COLOR256)),You already have the %qF flag set.  Good.,%qM: @set me=%qF),Penn*,ifelse(hasflag(%#,setr(F,XTERM256)),You already have the %qF flag set.  Good.,%qM: @set me=%qF))]
+   ct_dreaming_1:1594732685:1594732685::A:[setq(0,#5f00ff)][setq(1,#5f5fff)][setq(2,#5f87ff)][setq(3,#5faf87)][setq(4,#5f87ff)][setq(5,#5f5fff)][setq(6,#5f00ff)][setq(I,rand(7))][iter(lnum(0,div(strlen(%0),3)),ansi(<[r(%qI)][setq(I,mod(add(%qI,1),7))]>,mid(%0,mul(##,3),3)),,@@)]
+   ct_dreaming_2:1594732685:1594732685::A:ansi(<#06989A>/,%0)
+   ct_dreaming_3:1594732685:1594732685::A:ansi(<#1656A1>/,%0)
+   ct_dreaming_staff:1594732685:1594732685::A:ansi(mh,%0)
+   ct_dreaming_timeout:1594732685:1594732685::A:ansi(y,%0)
+   ct_dreaming_unread:1594732685:1594732685::A:ansi(g,%0)
+   ct_dreamingo:1594732685:1594732685::A:Extra Flags Required: Rhost requires XTERMCOLOR, MUX requires COLOR256, Penn requires XTERM256%rRhost and Penn can use '+deeppink2' instead of <#ff0087> if desired.[switch(version(),Tiny*,%r[u(c,3,Will not work on TinyMUSH.)],)]
+   ct_dreamingo_1:1594732685:1594732685::A:[setq(C,rotr(39 3f 45 48 45 3f 39%b,mul(rand(7),3)))][nsiter(lnum(1,strlen(%0)),ansi(0x[extract(%qC,add(1,mod(div(#@,3),words(%qC))),1)]/,elementpos(%0,#@)))]
+   ct_dreamingo_2:1594732685:1594732685::A:ansi(c,%0)
+   ct_dreamingo_3:1594732685:1594732685::A:ansi(b,%0)
+   ct_subtle:1594732685:1594732685::A:A dark theme, not too vibrant.
+   ct_subtle_1:1594732685:1594732685::A:ansi(xh,%0)
+   ct_subtle_2:1594732685:1594732685::A:ansi(g,%0)
+   ct_subtle_3:1594732685:1594732685::A:ansi(h,%0)
+   ct_subtle_staff:1594732685:1594732685::A:ansi(mh,%0)
+   ct_subtle_timeout:1594732685:1594732685::A:ansi(y,%0)
+   ct_subtle_unread:1594732685:1594732685::A:ansi(g,%0)
+   d_256flag_mux:1594732685:1594732685::A:COLOR256
+   d_256flag_pennmush:1594732685:1594732685::A:XTERM256
+   d_256flag_rhostmush:1594732685:1594732685::A:XTERMCOLOR
+   d_cap:1594732685:1594732685::A:% capacity
+   d_no_messages:1594732685:1594732685::A:(No messages)
+   d_pzero:1594732685:1594732685::A:\%0
+   description:1594732685:1594732685::A:[iter(setdiff(lattr(me),Desc),ljust(##,18))]
+   do_color:1594732685:1594732685::A:1
+   do_timeouts:1594732685:1594732685::A:@trigger me/tr_timeout; @wait 86400={@trigger me/do_timeouts}
+   fn_b10-to-b36:1594732685:1594732685::A:[setq(0,%0)][edit(iter(u(fn_b36_mags,%q0),[extract(v(b36_digits),add(div(%q0,##),1),1)][setq(0,sub(%q0,mul(##,div(%q0,##))))]),%b,)]
+   fn_b36-to-b10:1594732685:1594732685::A:[setq(0,ucstr(%0))][setq(1,strlen(%q0))][fold(me/addem,[iter(lnum(%q1),mul(sub(member(v(b36_digits),mid(%q0,##,1)),1),power(36,sub(sub(%q1,##),1))))],0)]
+   fn_b36_mags:1594732685:1594732685::A:revwords(iter(v(b36_pows),switch([div(##,%0)]:[eq(##,%0)],0:*,##,*:1,##)))
+   fn_b36_sorter:1594732685:1594732685::A:comp(ulocal(FN_B36-TO-B10,%0),ulocal(FN_B36-TO-B10,%1))
+   fn_bbprompt:1594732685:1594732685::A:[u(c,3,BBS)][u(c,2,:)]
+   fn_bbs_staff:1594732685:1594732685::A:hasflag(%0,wizard)
+   fn_bname:1594732685:1594732685::A:ifelse(u(fn_bbs_staff,ifelse(isdbref(%0),%0,*%0)),u(c,staff,ifelse(isdbref(%0),name(%0),%0)),ifelse(isdbref(%0),name(%0),%0))
+   fn_border:1594732685:1594732685::A:u(c,1,repeat(=,%0))
+   fn_border_cent:1594732685:1594732685::A:[setq(F,ulocal(fn_cent,%0,%1))][u(fn_border,first(%qF,:))] [u(c,2,%0)] [u(fn_border,rest(%qF,:))]
+   fn_cent:1594732685:1594732685::A:[setq(D,div(setr(S,sub(%1,add(strlen(%0),2))),2))][switch(add(%qD,%qD),%qS,%qD:%qD,[add(%qD,1)]:%qD)]
+   fn_color_mux:1594732685:1594732685::A:hasflag(%0,ANSI)
+   fn_color_pennmush:1594732685:1594732685::A:hasflag(%0,COLOR)
+   fn_color_rhostmush:1594732685:1594732685::A:and(hasflag(%0,ANSI),hasflag(%0,ANSICOLOR))
+   fn_flags_check:1594732685:1594732685::A:ifelse(words(setr(M,ulocal(fn_flags_msg,%#))),%r[u(fn_bbprompt)] %qM,)
+   fn_flags_msg:1594732685:1594732685::A:switch([setr(V,first(version()))]:[u(fn_color_%qV,%0)]:[hasflag(%0,v(d_256flag_%qV))],TinyMUSH:*:*,,*:1:1,,*:0:*,,*:1:0,u(FN_SET_FLAGS,%qV))
+   fn_grep:1594732685:1594732685::A:iter(lattr(%0/%1),switch(strmatch(get(%0/##),*%2*),1,##))
+   fn_hasconfig:1594732685:1594732685::A:or(hasattr(%0,anonymous),neq(get(%0/config_timeout),get(#4[0m/config_timeout)))
+   fn_id:1594732685:1594732685::A:[ifelse(strmatch(%0,*/*),[setq(B,first(%0,/))][setq(B,ifelse(isdbref(%qB),%qB,ulocal(GET_GROUP,%qB)))][setq(M,rest(%0,/))][ifelse(words(setr(I,ulocal(fn_id_by_ord,%qB,%qM))),%qB:%qI,)],[first(iter(v(GROUPS),ifelse(member(ulocal(fn_mess_list_threaded,##),%0),##:%0,)))])]
+   fn_id_by_ord:1594732685:1594732685::A:[setq(B,ifelse(isdbref(%0),%0,ulocal(GET_GROUP,%0)))][setq(P,extract(get(%qB/MESS_LST),%1,1))][ifelse(strmatch(%1,*.*),[extract(get(%qB/REPLY_%qP),rest(%1,.),1)],%qP)]
+   fn_id_list:1594732685:1594732685::A:iter(%1,ifelse(strmatch(##,*.*),extract(get(%0/REPLY_[extract(get(%0/MESS_LST),##,1)]),rest(##,.),1),extract(get(%0/MESS_LST),##,1)))
+   fn_id_list_from_range:1594732685:1594732685::A:iter(%1,ifelse(strmatch(##,*-*),[setq(B,first(##,-))][setq(E,rest(##,-))][setq(L,iter(lnum(%qB,%qE),[setr(I,ulocal(fn_id_by_ord,%0,%i0))] [get(%0/reply_%qI)]))][ifelse(strmatch(%qB,*.*),[setq(L,remove(%qL,[setr(I,ulocal(fn_id_by_ord,%0,first(%qB,.)))] [extract(get(%0/reply_%qI),1,sub(rest(%qB,.),1))]))],)][ifelse(strmatch(%qE,*.*),[setq(L,remove(%qL,[setq(I,ulocal(fn_id_by_ord,%0,first(%qE,.)))] [extract(get(%0/reply_%qI),add(rest(%qE,.),1),words(get(%0/reply_%qI)))]))],)]%qL,[setr(I,ulocal(fn_id_by_ord,%0,first(##,*)))] [switch(words(##,*),1,,get(%0/reply_%qI))]))
+   fn_ids_and_replies:1594732685:1594732685::A:[iter(%1,ifelse(strmatch(##,*.*),ulocal(fn_id_by_ord,%0,##),[setr(I,extract(get(%0/mess_lst),##,1))]%b[get(%0/REPLY_%qI)]))]
+   fn_inc_next_mess:1594732685:1594732685::A:ulocal(fn_b10-to-b36,add(ulocal(fn_b36-to-b10,%0),1))
+   fn_is_valid_id:1594732685:1594732685::A:switch(words(rest(ulocal(fn_id,%0/%1),:)),0,0,1)
+   fn_line:1594732685:1594732685::A:u(c,1,repeat(-,%0))
+   fn_line_cent:1594732685:1594732685::A:[setq(F,ulocal(fn_cent,%0,%1))][u(fn_line,first(%qF,:))] [u(c,2,%0)] [u(fn_line,rest(%qF,:))]
+   fn_makelist:1594732685:1594732685::A:map(me/fn_maplist,secure(%0))
+   fn_makereplylist:1594732685:1594732685::A:[setq(B,first(%0,-))][setq(E,rest(%0,-))][ifelse(strmatch(%0,*.*),[setq(X,rest(%qB,.))][setq(Y,rest(%qE,.))][ifelse(%qX,setq(B,first(%qB,.)),[setq(X,1)]%qB%b)][iter(lnum(%qX,%qY),%qB.##)],lnum(%qB,%qE))]
+   fn_maplist:1594732685:1594732685::A:switch([strmatch(%0,?*-*)]:[strmatch(%0,*.*)],1:0,lnum(before(%0,-),after(%0,-)),1:1,ulocal(fn_makereplylist,%0),%0)
+   fn_mess_list_threaded:1594732685:1594732685::A:iter(get(%0/MESS_LST),## [get(%0/reply_##)])
+   fn_msg:1594732685:1594732685::A:[ifelse(strmatch(%0,*/*),[setq(C,first(%0,/))][setq(B,extract(v(GROUPS),%qC,1))][setq(N,rest(%0,/))][setq(I,rest(ulocal(fn_id,%qB/%qN),:))],[setq(0,ucstr(%0))][setq(L,trim(ulocal(fn_id,%q0)))][setq(B,first(%qL,:))][setq(I,rest(%qL,:))][setq(C,member(v(GROUPS),%qB))][setq(N,ulocal(fn_ord_by_id,%qB,%qI))])][setq(H,get(%qB/HDR_%qI))][setq(T,ulocal(bbtime_view_details,index(%qH,|,2,1)))]%r[u(fn_border_cent,name(%qB),78)]%rMessage: %qC/%qN[setq(W,sub(78,add(strlen(Message: %qC/%qN),strlen(ldelete(%qT,4)))))][center(Author: [mid([u(fn_bname,index(%qH,|,3,1))][ifelse(and(hasattr(%qB,anonymous),u(fn_bbs_staff,%#)),%b\([u(fn_bname,index(%qH,|,4,1))]\),)],0,sub(%qW,4))],%qW)][ldelete(%qT,4)]%r[ljust(u(c,3,mid(index(%qH,|,1,1),0,64)),70)][elements(%qT,4)]%r[switch(ulocal(fn_timeout_close,index(%qH,|,5,1)),1,u(fn_line_cent,{(timeout warning)},78),u(fn_line,78))]%r[get(%qB/BDY_%qI)]%r[u(fn_border,78)]
+   fn_msg_flags:1594732685:1594732685::A:switch([member(get(%0/bb_read),%2)]:[u(fn_timeout_close,index(get(%1/hdr_%2),|,5,1))],0:*,[u(c,unread,U)],*:1,[u(c,timeout,T)])
+   fn_msg_old:1594732685:1594732685::A:[ifelse(strmatch(%0,*/*),[setq(C,first(%0,/))][setq(B,extract(v(GROUPS),%qC,1))][setq(N,rest(%0,/))][setq(I,rest(ulocal(fn_id,%qB/%qN),:))],[setq(0,ucstr(%0))][setq(L,trim(ulocal(fn_id,%q0)))][setq(B,first(%qL,:))][setq(I,rest(%qL,:))][setq(C,member(v(GROUPS),%qB))][setq(N,ulocal(fn_ord_by_id,%qB,%qI))])][setq(H,get(%qB/HDR_%qI))][setq(T,ulocal(bbtime_view_details,index(%qH,|,2,1)))]%r[u(fn_border_cent,name(%qB),78)]%r[ljust(Message: %qC/%qN[switch(ulocal(fn_timeout_close,index(%qH,|,5,1)),1,{%b(timeout warning)})],35)]Author[rjust(ldelete(%qT,4),37)][setq(W,0)][iter(index(%qH,|,1,1),switch(%qW:[gte(add(strlen(%qY),strlen(%b##)),36)],1:*,setq(Z,%qZ ##),0:1,[setq(W,1)][setq(Z,##)],setq(Y,%qY ##)))]%r[ljust(u(c,3,trim(%qY)),35)][ljust(mid([u(fn_bname,index(%qH,|,3,1))][ifelse(and(hasattr(%qB,anonymous),u(fn_bbs_staff,%#)),%b\([u(fn_bname,index(%qH,|,4,1))]\),)],0,29),35)][elements(%qT,4)]%r[ifelse(strlen(%qZ),[u(c,3,%qZ)]%r,)][u(fn_line,78)]%r[get(%qB/BDY_%qI)]%r[u(fn_border,78)]
+   fn_ord_by_id:1594732685:1594732685::A:ifelse(setr(P,member(get(%0/mess_lst),%1)),%qP,[member(get(%0/mess_lst),setr(P,get(%0/parent_%1)))].[member(get(%0/reply_%qP),%1)])
+   fn_readable_ids:1594732685:1594732685::A:iter(u(valid_groups,%0,read),ulocal(fn_mess_list_threaded,##))
+   fn_set_flags:1594732685:1594732685::A:The BBS has colors configured, but you're missing a flag for extended colors.  [ansi(hr,For best results type:)] [ansi(hc,@set me=[v(D_256FLAG_%0)])]
+   fn_sort_b36:1594732685:1594732685::A:sortby(fn_b36_sorter,%0)
+   fn_timeout_close:1594732685:1594732685::A:switch(%0:[lte(sub(%0,secs()),259200)],0:*,0,*:1,1,0)
+   fn_unread_list:1594732685:1594732685::A:edit(sort(iter(%0,u(fn_ord_by_id,%2,##))),%b,\,%b)
+   fn_unreadids:1594732685:1594732685::A:[setq(L,ulocal(fn_mess_list_threaded,%1))][sort(setdiff(%qL,get(%0/bb_read)))]
+   get_group:1594732685:1594732685::A:switch(isnum(%0),1,extract(v(groups),%0,1),locate(#4[0m,%0,ni))
+   groups:1594732776:1594732776::A:#6
+   isgroupread:1594732685:1594732685::A:switch(setdiff(%1,get(%0/bb_read)),,,u(c,unread,U))
+   master_lst:1594733047:1594733047::A:1
+   nxt_mess:1594732685:1594733047::A:2
+   tr_cleanup_cleargroup:1594732685:1594732685::A:@switch v(delete_grp)=%0,{&delete_grp #4[0m; @pemit [u(fn_bbprompt)] %1=[u(c,3,BBS:)] Group '[u(c,2,name(%0))]' no longer marked for deletion.}
+   tr_config_anonymous:1594732685:1594732685::A:&anonymous %0=[ifelse([%1],[%1],)]; @pemit %2=Posters on the [name(%0)] group will show up as [ifelse([%1],['%1'],themselves)].
+   tr_config_timeout:1594732685:1594732685::A:&config_timeout %0=[mul(%1,86400)]; @pemit %2=New messages for group '[name(%0)]' have [ifelse(%1,a %1 day,no)] timeout.
+   tr_gconfig_autotimeout:1594732685:1594732685::A:@switch [eq(hasattr(me,startup),setr(0,switch(%0,on,1,0)))]:%0=1:*,{@pemit %1=BB autotimeout is already [ifelse(%q0,on,off)].},0:on,{@startup me=@trigger me/do_timeouts; @trigger me/do_timeouts; @pemit %1=BB autotimeout turned on.},{@startup me; @pemit %1=BB autotimeout turned off.; @halt me}
+   tr_gconfig_color:1594732685:1594732685::A:&do_color me=[switch(lcstr(%0),yes,1,true,1,on,1,1,1,0)];@pemit %1=BBS is [ifelse(v(do_color),now,no longer)] using color.
+   tr_gconfig_timeout:1594732685:1594732685::A:&config_timeout me=[mul(%0,86400)]; @pemit %1=BB global config parameter 'timeout': [ifelse(%0,%0 days,none)].%rAny new groups will have this value set as their default timeout.
+   tr_post_notify:1594732685:1594732685::A:@switch hasflag(%0,DARK)=0,{@pemit/list iter(remove(lwho(),%0),switch(or(member([get(##/bb_omit)] [get(##/bb_silent)],%1),not(u(%1/canread,##))),0,##))=[u(fn_bbprompt)] New BB message ([member(v(groups),%1)]/%2) posted to '[name(%1)]' by [ifelse(hasattr(%1,anonymous),get(%1/anonymous),name(%0))]: %3}
+   tr_post_reply:1594732685:1594732685::A:th [setq(B,%0)][setq(I,%1)][setq(N,v(nxt_mess))][setq(S,re: [index(get(%qB/hdr_%qI),|,1,1)])];&nxt_mess #4[0m=[ulocal(fn_inc_next_mess,%qN)];&master_lst #4[0m=[cat(v(master_lst),%qN)];&parent_%qN %qB=%qI;&hdr_%qN %qB=%qS|[u(bbtime)]|[edefault(%qB/anonymous,mid(name(%2),0,24))]|[owner(%2)]|[ifelse(get(%qB/config_timeout),add(get(%qB/config_timeout),secs()),0)];&bdy_%qN %qB=[%3][ifelse(and(hasattr(%2,bb_sig),not(hasattr(%qB,anonymous))),{%r[ulocal(%2/bb_sig)]},)];&reply_%qI %qB=[get(%qB/reply_%qI)] %qN;&last_mod %qB=[u(bbtime)];@pemit %2=[u(fn_bbprompt)] You post your reply to '%qS' in Group [member(v(groups),%qB)] ([name(%qB)])[ifelse(and(hasattr(%2,bb_sig),hasattr(%qB,anonymous)),{%b%bThis is an anonymous group, your BB_SIG was -not- appended.},)];&bb_read %2=[setunion(get(%2/bb_read),%qN)];@trigger #4[0m/tr_post_notify=%2,%qB,[member(get(%qB/MESS_LST),%qI)].[member(get(%qB/REPLY_%qI),%qN)],[mid(%1, 0, 34)]
+   tr_timeout:1594732685:1594732685::A:@dolist v(groups)={@trigger me/tr_timeout_group=##}
+   tr_timeout_group:1594732685:1594732685::A:@dolist ulocal(fn_mess_list_threaded,%0) = {@switch and(setr(S,extract(get(%0/hdr_##),5,1,|)),gt(secs(),%qS),not(hasattr(%0,reply_##)))=1,{&hdr_## %0;&bdy_## %0;@switch hasattr(%0,parent_##)=1,{th [setq(P,get(%0/parent_##))];&parent_## %0;&reply_%qP %0=[remove(get(%0/reply_%qP),##)];},{&mess_lst %0=[remove(get(%0/mess_lst),##)];};&master_lst #4[0m=[remove(v(master_lst),##)]}}
+   valid_configs:1594732685:1594732685::A:anonymous timeout
+   valid_global_configs:1594732685:1594732685::A:color timeout autotimeout color_pri color_sec color_ter
+   valid_groups:1594732685:1594732685::A:iter(v(groups),switch(and(u(##/can%1,%0),not(member(get(%0/bb_omit),##))),1,##))
+   version:1594732685:1594732685::A:5.0.0
+   version_build:1594732685:1594732685::A:b57
+}
+obj[5] {
+   obj_cname:1594732688:1594732688::A:BBS - Myrddin's Global BBS v5.0.0
+   obj_content:1594732688:1596145545::L:6,4
+   obj_created_by:1594732685:1594732685::A:localhost
+   obj_created_date:1594732685:1594732685::A:Tue Jul 14 08:18:05 2020
+   obj_flag:1594732685:1594732685::L:object
+   obj_home:1594732685:1594732685::A:0
+   obj_last_inhabited:1594732685:1594732685::A:Tue Jul 14 08:18:05 2020
+   obj_location:1594732685:1594732685::A:0
+   obj_money:1594732685:1594732685::A:10
+   obj_name:1594732685:1594732688::A:BBS - Myrddin's Global BBS v5.0.0
+   obj_owner:1594732685:1594732685::A:0
+   obj_parent:1594732685:1594732685::A:4
+   cmd_+bb:1594732685:1594732685::A:$+bb *:@switch hasattr(#4[0m,bb_post_hdr_%#)=0,{@pemit %#=[u(fn_bbprompt)] You do not have a bbpost in progress.},{&bb_post_bdy_%# #4[0m=[ifelse(hasattr(#4[0m,bb_post_bdy_%#),[v(bb_post_bdy_%#)]%b,)]%0;@pemit %#=[u(fn_bbprompt)] Text added to bbpost.}
+   cmd_+bbcatchup:1594732685:1594732685::A:$+bbcatchup *:@switch lcstr(%0)=all,{&bb_read %#=[v(master_lst)];@pemit %#=[u(fn_bbprompt)] All postings on all boards marked as read.},{@dolist [setq(1,u(valid_groups,%#,read))][u(fn_makelist,%0)]={@switch member(%q1,[setq(0,u(get_group,##))]%q0)=0,{@pemit %#=[u(fn_bbprompt)] You do not subscribe to Group ##.},{&bb_read %#=[setunion(get(%#/bb_read),ulocal(fn_mess_list_threaded,%q0))];@pemit %#=[u(fn_bbprompt)] All postings on Group #[member(v(groups),%q0)] ([name(%q0)]) marked as read.}}}
+   cmd_+bbcleargroup:1594732685:1594732685::A:$+bbcleargroup *:@switch and(u(fn_bbs_staff,%#),member(v(groups),setr(0,u(get_group,%0))))=1,{&delete_grp #4[0m=%q0;@wait 30={@trigger #4[0m/TR_CLEANUP_CLEARGROUP=%q0,%#};@pemit %#=%r[space(15)][ansi(rh,********)] [ansi(yh,Warning)] [ansi(rh,********)]%r%rDeleting Group #%0 ([u(c,2,name(%q0))]) will also delete the [words(ulocal(fn_mess_list_threaded,%q0))] messages in that group.%rIf you still wish to proceed, type '[ansi(h,+bbconfirm %0)]'%rOtherwise, this action will be cancelled in 30 seconds.%r%r[space(15)][ansi(rh,repeat(*,25))]%r},{&delete_grp #4[0m;@pemit %#=[u(fn_bbprompt)] You can't remove that group (either that group does not exist, or you are not the owner).}
+   cmd_+bbcolor:1594732685:1594732685::A:$+bbcolor *=*:@switch/first [u(fn_bbs_staff,%#)]=0,{@pemit %#=Huh?%b%b(Type "help" for help.)},{@switch [member(lattr(#4[0m/c_*),ucstr(c_%0))]=0,{@pemit %#=[u(fn_bbprompt)] Not a valid color type.  Please see '+bbcolors' for types.},{@pemit %#=[u(fn_bbprompt)] BBS color '%0', old: [u(c_%0,v(C_%0))];&C_THEME #4[0m;&C_%0 #4[0m=%1;@pemit %#=[u(fn_bbprompt)] BBS color '%0', new: [u(c_%0,v(C_%0))]}}
+   cmd_+bbcolors:1594732685:1594732685::A:$+bbcolors:@pemit %#=[u(fn_border_cent,Myrddin's Global BBS v[get(#4[0m/version)] - Global Colors,78)]%r[switch(version(),Rhost*,ifelse(hasflag(%#,setr(F,XTERMCOLOR)),,%r[center(ansi(rh,For best results you should: @set me=%qF),78)]%r),MUX*,ifelse(hasflag(%#,setr(F,COLOR256)),,%r[center(ansi(rh,For best results you should: @set me=%qF),78)]%r),Penn*,ifelse(hasflag(%#,setr(F,XTERM256)),,%r[center(ansi(rh,For best results you should: @set me=%qF),78)]%r))]%r[rjust(u(c,3,Type),30)][space(5)][u(c,3,Code)]%r[rjust(repeat(-,4),30)][space(5)][repeat(-,4)][iter(remove(lattr(#4[0m/c_*),C_THEME),%r[rjust(rest(##,_),30)][space(5)][u(##,v(##))])]%r%rThese are the global colors.%b%b[ifelse(t(v(c_theme)),The BBS is using the '[u(c_3,v(c_theme))]' theme.,The BBS is not using a defined color theme.)]%r%r[ifelse(u(fn_bbs_staff,%#),{Change codes with +bbcolor:  +bbcolor <type>=<code>%rYou will need to 'escape' the %%0.  Example:%r%r[space(5)]+bbcolor timeout=ansi(r,[v(d_pzero)])%r%rThe BBS color system is currently [ifelse(v(do_color),on,off)].  To turn it [setr(0,ifelse(v(do_color),off,on))], type: +bbconfig color=%q0%r},)][u(fn_border,78)]
+   cmd_+bbcolortheme:1594732685:1594732685::A:$+bbcolortheme *:@switch/first [u(fn_bbs_staff,%#)]=0,{@pemit %#=[u(fn_bbprompt)] You're not allowed to change the global color theme.  Perhaps you meant '+bbcolortheme/me %0'?},{@switch [match(v(color_themes),%0,:)]=0,{@pemit %#=[u(fn_bbprompt)] Not a valid color theme  Please see '+bbcolorthemes' for types.},{@pemit %#=[u(fn_border_cent,Myrddin's Global BBS v[v(version)] - Setting Global Color Theme,78)]%rSetting Theme: [u(c,3,%0)]%r%rOld [ljust('1':,13)][u(c_1,v(C_1))]%rOld [ljust('2':,13)][u(c_2,v(C_2))]%rOld [ljust('3':,13)][u(c_3,v(C_3))]%rOld [ljust('staff':,13)][u(c_staff,v(C_staff))]%rOld [ljust('unread':,13)][u(c_unread,v(C_unread))]%rOld [ljust('timeout':,13)][u(c_timeout,v(C_timeout))]%r;&C_theme #4[0m=[lcstr(%0)];&C_1 #4[0m=[v(ct_%0_1)];&C_2 #4[0m=[v(ct_%0_2)];&C_3 #4[0m=[v(ct_%0_3)];&C_staff #4[0m=[v(ct_%0_staff)];&C_unread #4[0m=[v(ct_%0_unread)];&C_timeout #4[0m=[v(ct_%0_timeout)];@pemit %#=New [ljust('1':,13)][u(c_1,v(C_1))]%rNew [ljust('2':,13)][u(c_2,v(C_2))]%rNew [ljust('3':,13)][u(c_3,v(C_3))]%rNew [ljust('staff':,13)][u(c_staff,v(C_staff))]%rNew [ljust('unread':,13)][u(c_unread,v(C_unread))]%rNew [ljust('timeout':,13)][u(c_timeout,v(C_timeout))]%r;@pemit %#=[u(fn_border,78)]}}
+   cmd_+bbcolortheme/add:1594732685:1594732685::A:$+bbcolortheme/add *:@switch/first [u(fn_bbs_staff,%#)]=0,{@pemit %#=Huh?%b%b(Type "help" for help.)},{th [setq(T,first(%0,=))][setq(D,rest(%0,=))];@switch [match(v(color_themes),%qT,:)]=0,{&c_theme  #4[0m=%qT;&ct_%qT   #4[0m=%qD;&ct_%qT_1 #4[0m=[v(c_1)];&ct_%qT_2 #4[0m=[v(c_2)];&ct_%qT_3 #4[0m=[v(c_3)];&ct_%qT_staff #4[0m=[v(c_staff)];&ct_%qT_unread #4[0m=[v(c_unread)];&ct_%qT_timeout #4[0m=[v(c_timeout)];&color_themes #4[0m=[setunion(v(color_themes),%qT,:)];@pemit %#=[u(fn_bbprompt)] Current colors have been saved as color theme '%qT'.},{@pemit %#=[u(fn_bbprompt)] Color theme '%qT' already exists.  Choose a new new name, or '+bbcolortheme/del %qT' first.}}
+   cmd_+bbcolortheme/del:1594732685:1594732685::A:$+bbcolortheme/del *:@switch/first [u(fn_bbs_staff,%#)]=0,{@pemit %#=Huh?%b%b(Type "help" for help.)},{@switch [match(v(color_themes),%0,:)]=0,{@pemit %#=[u(fn_bbprompt)] Not an existing color theme.  Please see '+bbcolorthemes' for the current list.},{@switch strmatch(v(c_theme),%0)={&c_theme #4[0m};&ct_%0_1 #4[0m;&ct_%0_2 #4[0m;&ct_%0_3 #4[0m;&ct_%0_staff #4[0m;&ct_%0_unread #4[0m;&ct_%0_timeout #4[0m;&color_themes #4[0m=[ldelete(v(color_themes),match(v(color_themes),%0,:),:)];@pemit %#=[u(fn_bbprompt)] Color theme '%0' deleted.}}
+   cmd_+bbcolortheme/me:1594732685:1594732685::A:$+bbcolortheme/me *:@switch [match(v(color_themes),%0,:)]=0,{@pemit %#=[u(fn_bbprompt)] Color theme '%0' doesn't exist.  Please see '+bbcolorthemes' for the current list.},{&_c_theme %#=[lcstr(%0)];&_c_1 %#=[v(ct_%0_1)];&_c_2 %#=[v(ct_%0_2)];&_c_3 %#=[v(ct_%0_3)];&_c_staff %#=[v(ct_%0_staff)];&_c_unread %#=[v(ct_%0_unread)];&_c_timeout %#=[v(ct_%0_timeout)];@pemit %#=[u(fn_bbprompt)] [u(c,1,repeat(-,40))];@pemit %#=[u(fn_bbprompt)] [u(ct_%0)];@pemit %#=[u(fn_bbprompt)] [u(c,1,repeat(-,40))];@pemit %#=[u(fn_bbprompt)] You are now using color theme '%0'.;@pemit %#=[u(fn_bbprompt)] [u(c,1,repeat(-,40))];}
+   cmd_+bbcolortheme/me/clear:1594732685:1594732685::A:$+bbcolortheme/me/clear:&_c_theme %#;&_c_1 %#;&_c_2 %#;&_c_3 %#;&_c_staff %#;&_c_unread %#;&_c_timeout %#;@pemit %#=[u(fn_bbprompt)] Personal color theme cleared.  You're now using the global bb color theme.
+   cmd_+bbcolorthemes:1594732685:1594732685::A:$+bbcolorthemes:@pemit %#=%r[u(fn_border_cent,Myrddin's Global BBS v[get(#4[0m/version)] - Color Themes,78)][iter(v(color_themes),%r%r[u(ct_##_3,##)]%r[u(ct_##_1,repeat(-,57))]%r[ifelse(hasattr(#4[0m,ct_##),[u(ct_##)]%r%r,)][space(5)][ljust(1:,5)][ljust(u(ct_##_1,v(ct_##_1)),25)] [ljust(staff:,10)][u(ct_##_staff,v(ct_##_staff))]%r[space(5)][ljust(2:,5)][ljust(u(ct_##_2,v(ct_##_2)),25)] [ljust(unread:,10)][u(ct_##_unread,v(ct_##_unread))]%r[space(5)][ljust(3:,5)][ljust(u(ct_##_3,v(ct_##_3)),25)] [ljust(timeout:,10)][u(ct_##_timeout,v(ct_##_timeout))]%r[u(ct_##_1,repeat(-,57))],:)]%r%r[setq(T,v(c_theme))][ifelse(hasattr(#4[0m,c_theme),The BBS is using the '[u(ct_%qT_3,%qT)]' color theme.%r,)][ifelse(hasattr(%#,_c_theme),You are personally using the '[u(c,3,get(%#/_c_theme))]' color theme.%r,)]%r[ifelse(u(fn_bbs_staff,%#),[u(c,2,To set the global color theme:)]  +bbcolortheme <theme>%r,)][u(c,2,To set a personal color theme:)]  +bbcolortheme/me <theme>%r[u(c,2,To clear your personal color theme:)]  +bbcolortheme/me/clear%r[u(fn_border,78)]
+   cmd_+bbconfig:1594732685:1594732685::A:$+bbconfig:@pemit %#=[u(fn_border_cent,Myrddin's Global BBS v[get(#4[0m/version)],78)]%rGlobal Config Parameters:%r%r[rjust(color:,15)] [ifelse(v(do_color),yes,no)]%r[rjust(timeout:,15)] [div(get(#4[0m/config_timeout),86400)] days%r[rjust(autotimeout:,15)] [ifelse(hasattr(#4[0m,startup),on,off)]%r[u(fn_line,78)]%rBoard Config Parameters:%r%r%b[iter(filter(#4[0m/fn_hasconfig,get(#4[0m/groups)),%b%b[name(##)]%r[ifelse(hasattr(##,anonymous),[space(5)]anonymous: [get(##/anonymous)]%r,)][ifelse(neq(get(##/config_timeout),get(#4[0m/config_timeout)),[space(5)]timeout: [ifelse(setr(T,div(get(##/config_timeout),86400)),u(c,timeout,%qT days),u(c,2,disabled))]%r,)]%r)][u(fn_border,78)]
+   cmd_+bbconfig2:1594732685:1594732685::A:$+bbconfig *=*:@switch [strmatch(%0,*/*)]:[u(fn_bbs_staff,%#)]=1:*,{},0:0,{@pemit %#=Huh?%b%b(Type "help" for help.)},{@switch [member(v(valid_global_configs),lcstr(%0))]=0,{@pemit %#=[u(fn_bbprompt)] Valid global config parameters are: [v(valid_global_configs)]},{@trigger #4[0m/tr_gconfig_%0=%1,%#}}
+   cmd_+bbconfig3:1594732685:1594732685::A:$+bbconfig */*=*:@switch/first u(fn_bbs_staff,%#)=0,{@pemit %#=Huh?%b%b(Type "help" for help.)},{@switch [setr(0,u(#4[0m/get_group,%0))]:[member(get(#4[0m/valid_configs),lcstr(%1))]=#-1:*,{@pemit %#=[u(fn_bbprompt)] '%0' is not a valid group name.},#-2:*,{@pemit %#=[u(fn_bbprompt)] '%0' is not specific enough.},*:0,{@pemit %#=[u(fn_bbprompt)] Valid config parameters are: [get(#4[0m/valid_configs)]},{@trigger #4[0m/tr_config_%1=%q0,%2,%#}}
+   cmd_+bbedit:1594732685:1594732685::A:$+bbedit */*=*/*:@switch strmatch(index(get([setr(B,u(get_group,%0))]/HDR_[setr(I,u(fn_id_by_ord,%qB,%1))]),|,4, 1),%#)=1,{&BDY_%qI %qB=[edit(get(%qB/BDY_%qI),{%2},{%3})];@pemit %#=[u(fn_border,78)]%rMessage [member(v(groups),%qB)]/%1 ([name(%qB)]/%1) now reads:%r[u(fn_line,78)]%r[get(%qB/BDY_%qI)]%r[u(fn_border,78)]},{@pemit %#=[u(fn_bbprompt)] Either that message does not exist, or you were not the original poster.}
+   cmd_+bbedit2:1594732685:1594732685::A:$+bbedit *=*/*:@switch strmatch([setq(0,ucstr(%0))]%q0,*/*)=0,{@switch %q0=TEXT,{@edit #4[0m/bb_post_bdy_%#={%1},{%2}},TITLE,{&bb_post_hdr_%# #4[0m=[index(get(#4[0m/bb_post_hdr_%#),|,1,1)]|[edit(index(get(#4[0m/bb_post_hdr_%#),|,2,1),{%1},{%2})]};@wait 0={@pemit %#=[u(fn_border_cent,BB Post in Progress,78)]%rGroup: %b[name(index(get(#4[0m/bb_post_hdr_%#),|,1,1))]%rTitle: %b[index(get(#4[0m/bb_post_hdr_%#),|,2,1)]%r[u(fn_line,78)]%r[trim(get(#4[0m/bb_post_bdy_%#))]%r[u(fn_border,78)]}}
+   cmd_+bbhelp:1594732685:1594732685::A:$+bbhelp:@pemit %#=[u(fn_bbprompt)] Please use '+help bb'.
+   cmd_+bbjoin:1594732685:1594732685::A:$+bbjoin *:@switch member(NULL [get(%#/bb_omit)],[setq(0,u(#4[0m/get_group,%0))]%q0)=0,{@pemit %#=[u(fn_bbprompt)] [switch(member(u(#4[0m/valid_groups,%#,read),%q0),0,{Sorry, you don't have access to that board.},{You are already a member of the [name(%q0)] board.})]},{&bb_omit %#=[setdiff(get(%#/bb_omit),%q0)]; @pemit %#=[u(fn_bbprompt)] You have joined the [name(%q0)] board.}
+   cmd_+bbleave:1594732685:1594732685::A:$+bbleave *:@switch member(u(#4[0m/valid_groups,%#,read),[setq(0,u(#4[0m/get_group,%0))]%q0)=0,{@pemit %#=[u(fn_bbprompt)] You aren't currently subscribing to Board #%0. No ommission necessary.},{&bb_omit %#=[setunion(get(%#/bb_omit),%q0)]; @pemit %#=[u(fn_bbprompt)] You have removed yourself from the [name(%q0)] board.}
+   cmd_+bblist:1594732685:1594732685::A:$+bblist:@pemit %#=[u(fn_border,78)]%r[ljust(Available Bulletin Board Groups,37)]Member?[space(8)]Timeout (in days)%r[u(fn_line,78)]%b[iter(v(groups),switch(u(##/canread,%#),1,{%r%b[trim([ljust(member(v(groups),##),5)][ljust(u(c,3,name(##)),32)][ljust(switch(member(get(%#/bb_omit),##),0,Yes,No),19)][rjust(ifelse(get(##/config_timeout),div(get(##/config_timeout),86400),none),4)])]}))]%r[u(fn_line,78)]%rTo join groups, type '+bbjoin <group number or name>'%r[u(fn_border,78)]
+   cmd_+bblock:1594732685:1594732685::A:$+bblock *=*/*:@switch u(fn_bbs_staff,%#)=1,{@switch member(get(#4[0m/groups),setr(0,u(#4[0m/get_group,%0)))=0,{@pemit %#=[u(fn_bbprompt)] No such group as '%0'.},{@switch %1=flag,{&CANREAD %q0=\[or(hasflag(\%0,%2),u(fn_bbs_staff,\%0))]},{&CANREAD %q0=\[or(match(get(\%0/%1),%2),u(fn_bbs_staff,\%0))]}; @wait 1={&CANWRITE %q0=[get(%q0/CANREAD)]}; @pemit %#=[u(fn_bbprompt)] Group '%0' locked. Only people with %1=%2 can access.}},{@pemit %#=You cannot lock message groups.}
+   cmd_+bbmove:1594732685:1594732685::A:$+bbmove */* to *:@switch and(member(u(valid_groups,%#,read),[setq(0,u(get_group,%0))]%q0),member(u(valid_groups,%#,write),[setq(2,u(get_group,%2))]%q2),not(strmatch(%q0,%q2)))=0,{@pemit %#=[u(fn_bbprompt)] One of the selected groups is not valid (either it doesn't exist, you can't write to it, or you tried to 'move' to the same group).},{th [setq(U,u(fn_id,%0/%1))][setq(B,first(%qU,:))][setq(I,rest(%qU,:))];@switch or(strmatch(index(get(%qB/HDR_%qI),|,4, 1),%#),and(u(fn_bbs_staff,%#),member(ulocal(fn_mess_list_threaded,%qB),%qI)))=1,{&HDR_%qI %q2=[get(%qB/HDR_%qI)];&BDY_%qI %q2=[get(%qB/BDY_%qI)];&MESS_LST %q2=[cat(get(%q2/mess_lst),%qI)];&MESS_LST %qB=[remove(get(%qB/MESS_LST),%qI)];&HDR_%qI %qB;&BDY_%qI %qB;@switch [hasattr(%qB,PARENT_%qI)]:[hasattr(%qB,REPLY_%qI)]=1:*,{&REPLY_[setr(P,get(%qB/PARENT_%qI))] %qB=[remove(get(%qB/REPLY_%qP),%qI)];&PARENT_%qI %qB},0:1,{th [setq(R,get(%qB/REPLY_%qI))];@dolist %qR={&HDR_## %q2=[get(%qB/HDR_##)];&BDY_## %q2=[get(%qB/BDY_##)];&HDR_## %qB;&BDY_## %qB;&PARENT_## %q2=%qI};&REPLY_%qI %q2=%qR;&REPLY_%qI %qB};@pemit %#=[u(fn_bbprompt)] Message '%1' removed from group '%0' and added to group '%2' as message #[member(get(%q2/mess_lst),%qI)]},{@pemit %#=[u(fn_bbprompt)] Not a valid message number for that group.}}
+   cmd_+bbnewgroup:1594732685:1594732685::A:$+bbnewgroup *:@switch u(fn_bbs_staff,%#)=1, {@create %0; @wait 1={@switch [setr(0,num(%0))]=#-1,{@pemit %#=[u(fn_bbprompt)] That's not a good name for a group.},{&groups #4[0m=[switch(words(get(#4[0m/groups)),0,,[get(#4[0m/groups)]%b)]%q0; &own %q0=%#; @set %q0=safe; @set %q0=inherit; &last_mod %q0=[u(#4[0m/bbtime)]; &CANREAD %q0=1; &CANWRITE %q0=1; &config_timeout %q0=[get(#4[0m/config_timeout)]; @pemit %#=[u(fn_bbprompt)] Group number [member(get(#4[0m/groups),%q0)] added as '%0'. Messages will have [ifelse(get(%q0/config_timeout),a [div(get(%q0/config_timeout),86400)] day,no)] timeout.}}}, {@pemit %#=[u(fn_bbprompt)] You can't add groups to the message base.}
+   cmd_+bbnext:1594732685:1594732685::A:$+bbnext:@switch/first words(setr(U,ulocal(fn_sort_b36,setdiff(u(fn_readable_ids,%#),get(%#/bb_read)))))=0,{@pemit %#=[u(fn_bbprompt)] No unread messages.},{@pemit %#=[ulocal(fn_msg,first(%qU))];&bb_read %#=[setunion(get(%#/bb_read),first(%qU))];@wait 2={&bb_read %#=[setinter(get(%#/bb_read),v(master_lst))]}}
+   cmd_+bbnext2:1594732685:1594732685::A:$+bbnext *:@switch member(u(valid_groups,%#,read),setr(0,u(get_group,%0)))=0,{@pemit %#=[u(fn_bbprompt)] [switch(%q0,#-2,That Group name is not specific enough.,You do not subscribe to that Group.)]},{@switch/first words(setr(U,ulocal(fn_sort_b36,setdiff(ulocal(fn_mess_list_threaded,%q0),get(%#/bb_read)))))=0,{@pemit %#=[u(fn_bbprompt)] No unread messages in '[name(%q0)]'.},{@pemit %#=[ulocal(fn_msg,first(%qU))];&bb_read %#=[setunion(get(%#/bb_read),first(%qU))];@wait 2={&bb_read %#=[setinter(get(%#/bb_read),v(master_lst))]}}}
+   cmd_+bbnotify:1594732685:1594732685::A:$+bbnotify *=*:@switch/first [member(u(#4[0m/valid_groups,%#,read),setr(0,u(#4[0m/get_group,%0)))]:[member(on off,lcstr(%1))]:[lcstr(%1)]=0:*:*,{@pemit %#=[u(fn_bbprompt)] [switch(%q0,#-2,That Group name is not specific enough.,You do not subscribe to that Group.)]},*:0:*,{@pemit %#=[u(fn_bbprompt)] Invalid choice '%1'. Choices are 'on' or 'off'.},*:*:off,{&bb_silent %#=[setunion(get(%#/bb_silent),%q0)]; @pemit %#=[u(fn_bbprompt)] Post notification for BB Group '[name(%q0)]' turned off. You will no longer be notified of new postings to that Group.},{&bb_silent %#=[setdiff(get(%#/bb_silent),%q0)]; @pemit %#=[u(fn_bbprompt)] Post notification for BB Group '[name(%q0)]' turned on. You will now be notified of new postings to that Group.}
+   cmd_+bbpost:1594732685:1594732685::A:$+bbpost */*=*:@switch member(u(valid_groups,%#,write),setr(0,u(get_group,%0)))=0,{@pemit %#=[u(fn_bbprompt)] Either you do not subscribe to Group #%0, or are unable to post to it.},{&mess_lst %q0=[cat(get(%q0/mess_lst),setr(1,v(nxt_mess)))];&nxt_mess #4[0m=[ulocal(fn_inc_next_mess,%q1)];&master_lst #4[0m=[cat(v(master_lst),%q1)];&hdr_%q1 %q0=[mid(%1, 0, 64)]|[u(bbtime)]|[edefault(%q0/anonymous,mid(name(%#),0,24))]|[owner(%#)]|[ifelse(get(%q0/config_timeout),add(get(%q0/config_timeout),secs()),0)];&last_mod %q0=[u(bbtime)];&bdy_%q1 %q0=[%2][ifelse(and(hasattr(%#,bb_sig),not(hasattr(%q0,anonymous))),{%r[ulocal(%#/bb_sig)]},)];@pemit %#=[u(fn_bbprompt)] You post your note about '%1' in group [member(get(#4[0m/groups),%q0)] ([name(%q0)]) as message #[member(get(%q0/mess_lst),%q1)][ifelse(and(hasattr(%#,bb_sig),hasattr(%q0,anonymous)),{%b%bThis is an anonymous group, your BB_SIG was -not- appended.},)];&bb_read %#=[setunion(get(%#/bb_read),%q1)];@trigger #4[0m/tr_post_notify=%#,%q0,[member(get(%q0/mess_lst),%q1)],[mid(%1, 0, 34)]}
+   cmd_+bbpost-post:1594732685:1594732685::A:$+bbpost:@switch [hasattr(#4[0m,bb_post_hdr_%#)]:[hasattr(#4[0m,bb_post_bdy_%#)]:[strmatch(index(v(bb_post_hdr_%#),|,3,1),reply)]=0:0:*,{@pemit %#=[u(fn_bbprompt)] You do not have a bbpost in progress.},1:0:*,{@pemit %#=[u(fn_bbprompt)] Your post is empty. Please add text with the '+bbwrite <text>' command or discard the posting with the '+bbtoss' command.},1:1:1,{th [setq(H,v(bb_post_hdr_%#))][setq(B,index(%qH,|,1,1))][setq(I,index(%qH,|,4,1))];@trigger #4[0m/tr_post_reply=%qB,%qI,%#,v(bb_post_bdy_%#);&bb_post_bdy_%# #4[0m;&bb_post_hdr_%# #4[0m},{&mess_lst [setr(0,index(v(bb_post_hdr_%#),|,1,1))]=[cat(get(%q0/mess_lst),setr(1,v(nxt_mess)))];&nxt_mess #4[0m=[ulocal(fn_inc_next_mess,%q1)];&master_lst #4[0m=[cat(v(master_lst),%q1)];&hdr_%q1 %q0=[index(v(bb_post_hdr_%#),|,2,1)]|[u(bbtime)]|[edefault(%q0/anonymous,mid(name(%#),0,24))]|[owner(%#)]|[ifelse(get(%q0/config_timeout),add(get(%q0/config_timeout),secs()),0)];&last_mod %q0=[u(bbtime)];&bdy_%q1 %q0={[trim(v(bb_post_bdy_%#))][ifelse(and(hasattr(%#,bb_sig),not(hasattr(%q0,anonymous))),{%r[ulocal(%#/bb_sig)]},)]};@pemit %#=[u(fn_bbprompt)] You post your note about '[index(v(bb_post_hdr_%#),|,2,1)]' in group '[name(%q0)]' as message #[member(get(%q0/mess_lst),%q1)];&bb_read %#=[setunion(get(%#/bb_read),%q1)];@trigger #4[0m/tr_post_notify=%#,%q0,[member(get(%q0/mess_lst),%q1)],[index(v(bb_post_hdr_%#),|,2,1)];&bb_post_bdy_%# #4[0m;&bb_post_hdr_%# #4[0m}
+   cmd_+bbpost2:1594732685:1594732685::A:$+bbpost */*:@switch hasattr(#4[0m,bb_post_hdr_%#)=1,{@pemit %#=[u(fn_bbprompt)] You are already in the middle of writing a bbpost.},{@switch strmatch(%1,*=*)=0,{@switch member(u(valid_groups,%#,write),setr(0,u(get_group,%0)))=0,{@pemit %#=[u(fn_bbprompt)] Either you do not subscribe to Group #%0 or are unable to post to it.},{&bb_post_hdr_%# #4[0m=%q0|[mid(%1,0,64)]|post;@pemit %#=%rYou start your posting to Group #[member(v(groups),%q0)] ([name(%q0)]).%rYou can now compose the body of the post by using '+bbwrite <text>'%ror '+bb <text>'.  When you are finished, type '+bbpost' by itself.[ifelse(and(hasattr(%#,bb_sig),hasattr(%q0,anonymous)),{%b%bThis is an anonymous group. Your BB_SIG will -not- be appended.},)]}}}
+   cmd_+bbproof:1594732685:1594732685::A:$+bbproof:@switch hasattr(#4[0m,bb_post_hdr_%#)=0,{@pemit %#=[u(fn_bbprompt)] You do not have a bbpost in progress.},{@pemit %#=[u(fn_border_cent,BB Post in Progress,78)]%rGroup: %b[name(index(get(#4[0m/bb_post_hdr_%#),|,1,1))]%rTitle: %b[index(get(#4[0m/bb_post_hdr_%#),|,2,1)]%r[u(fn_line,78)]%r[trim(get(#4[0m/bb_post_bdy_%#))]%r[u(fn_border,78)]}
+   cmd_+bbread:1594732685:1594732685::A:$+bbread:@pemit %#=[u(fn_border,78)]%r[space(7)]Group Name[space(20)]Last Post[space(11)]# of messages%r[u(fn_line,78)][iter(u(valid_groups,%#,read),%r[rjust(member(v(groups),##),2)][center([switch([get(##/CANREAD)]:[get(##/CANWRITE)]:[u(##/CANWRITE,%#)],1:1:1,,1:*:1,{(-)},1:*:0,-,*)],5)][ljust(u(c,3,name(##)),30)][ljust(u(bbtime_view,get(##/LAST_MOD)),25)][rjust(words([setq(0,ulocal(fn_mess_list_threaded,##))]%q0),3)]%b[ljust(u(isgroupread,%#,%q0),2)])]%r[u(fn_line,78)]%r[center('*' = restricted[space(5)]'-' = read only[space(5)]'\(-\)' = read only\, but you can write,78)]%r[setq(M,ifelse(u(fn_bbs_staff,%#),{BBS at [round(mul(fdiv(strlen(v(master_lst)),v(buffer_size)),100),1)][v(d_cap)]},))][ifelse(strlen(%qM),u(fn_border_cent,%qM,78),u(fn_border,78))]
+   cmd_+bbread2:1594732685:1594732685::A:$+bbread *:@switch strmatch([%0],*/*)=0,{@switch member(u(valid_groups,%#,read),setr(0,u(get_group,%0)))=0,{@pemit %#=[u(fn_bbprompt)] [switch(%q0,#-2,That Group name is not specific enough.,You do not subscribe to that Group.)]},{@pemit %#=[u(fn_border,78)]%r[u(c,2,center(**** [name(%q0)] ****,78))]%r[space(11)]Message[space(28)]Posted[space(13)]By%r[u(fn_line,78)];@switch words(setr(L,ulocal(fn_mess_list_threaded,%q0)))=0,{@pemit %#=%r[center(v(d_no_messages),78)]%r%r[u(fn_line,78)]},{@dolist ulocal(fn_mess_list_threaded,%q0)={@pemit %#=[ljust([u(c,3,[member(v(groups),%q0)]/[ifelse(hasattr(%q0,parent_##),[member(get(%q0/MESS_LST),setr(P,get(%q0/parent_##)))].[member(get(%q0/reply_%qP),##)],[member(get(%q0/MESS_LST),##)])])],9)][ljust(u(fn_msg_flags,%#,%q0,##),2)][ifelse(hasattr(%q0,parent_##),[setq(R,get(%q0/reply_[get(%q0/parent_##)]))][setq(S,32)]%b[u(c,2,switch(member(%qR,##),words(%qR),`,|))]%b,setq(S,35))][ljust(left(index(setr(1,get(%q0/HDR_##)),|,1,1),sub(%qS,1)),%qS)][ljust(u(bbtime_view,index(%q1,|,2,1)),19)][mid([u(fn_bname,index(%q1,|,3,1))][ifelse(and(hasattr(%q0,anonymous),u(fn_bbs_staff,%#)),%b\([u(fn_bname,index(%q1,|,4,1))]\),)],0,21)][switch(member(%qL,##),words(%qL),%r[u(fn_border,78)])]}}}},{@switch member(u(valid_groups,%#,read),setr(0,u(get_group,setr(2,first(%0,/)))))=0,{@pemit %#=[u(fn_bbprompt)] [switch(%q0,#-2,That Group name is not specific enough.,You do not subscribe to that Group.)]},{th [setq(L,switch(rest(%0,/),u,[ulocal(fn_unreadids,%#,%q0)],[ulocal(fn_id_list_from_range,%q0,rest(%0,/))]))];@switch words(%qL)=0,{@pemit %#=[u(fn_bbprompt)] Invalid message list for group '[name(%q0)]'},{@dolist %qL={@pemit %#=[ulocal(fn_msg,##)];&bb_read %#=[setunion(get(%#/bb_read),##)];};};@wait 2={&bb_read %#=[setinter(get(%#/bb_read),v(master_lst))]}}}
+   cmd_+bbread2_old:1594732685:1594732685::A:$+bbreadold *:@switch strmatch([%0],*/*)=0,{@switch member(u(valid_groups,%#,read),setr(0,u(get_group,%0)))=0,{@pemit %#=[u(fn_bbprompt)] [switch(%q0,#-2,That Group name is not specific enough.,You do not subscribe to that Group.)]},{@pemit %#=[u(fn_border,78)]%r[u(c,2,center(**** [name(%q0)] ****,78))]%r[space(11)]Message[space(28)]Posted[space(13)]By%r[u(fn_line,78)];@switch words(setr(L,ulocal(fn_mess_list_threaded,%q0)))=0,{@pemit %#=%r[center(v(d_no_messages),78)]%r%r[u(fn_line,78)]},{@dolist ulocal(fn_mess_list_threaded,%q0)={@pemit %#=[ljust([u(c,3,[member(v(groups),%q0)]/[ifelse(hasattr(%q0,parent_##),[member(get(%q0/MESS_LST),setr(P,get(%q0/parent_##)))].[member(get(%q0/reply_%qP),##)],[member(get(%q0/MESS_LST),##)])])],9)][ljust(u(fn_msg_flags,%#,%q0,##),2)][ifelse(hasattr(%q0,parent_##),[setq(R,get(%q0/reply_[get(%q0/parent_##)]))][setq(S,32)]%b[u(c,2,switch(member(%qR,##),words(%qR),`,|))]%b,setq(S,35))][ljust(left(index(setr(1,get(%q0/HDR_##)),|,1,1),sub(%qS,1)),%qS)][ljust(u(bbtime_view,index(%q1,|,2,1)),19)][mid([u(fn_bname,index(%q1,|,3,1))][ifelse(and(hasattr(%q0,anonymous),u(fn_bbs_staff,%#)),%b\([u(fn_bname,index(%q1,|,4,1))]\),)],0,21)][switch(member(%qL,##),words(%qL),%r[u(fn_border,78)])]}}}},{@switch member(u(valid_groups,%#,read),setr(0,u(get_group,setr(2,first(%0,/)))))=0,{@pemit %#=[u(fn_bbprompt)] [switch(%q0,#-2,That Group name is not specific enough.,You do not subscribe to that Group.)]},{th [setq(L,switch(rest(%0,/),u,[ulocal(fn_unreadids,%#,%q0)],[ulocal(fn_id_list_from_range,%q0,rest(%0,/))]))];@switch words(%qL)=0,{@pemit %#=[u(fn_bbprompt)] Invalid message list for group '[name(%q0)]'},{@dolist %qL={@pemit %#=[ulocal(fn_msg_old,##)];&bb_read %#=[setunion(get(%#/bb_read),##)];};};@wait 2={&bb_read %#=[setinter(get(%#/bb_read),v(master_lst))]}}}
+   cmd_+bbremove:1594732685:1594732685::A:$+bbremove */*:@dolist [setq(0,u(get_group,%0))][revwords(sort(ulocal(fn_ids_and_replies,%q0,ulocal(fn_makelist,%1))))]={@switch or(strmatch(index(get(%q0/HDR_##),|,4, 1),%#), ulocal(fn_bbs_staff,%#))=1,{@pemit %#=[u(fn_bbprompt)] Message [u(fn_ord_by_id,%q0,##)] removed from group #[member(v(groups),%q0)] ([name(%q0)]).;&HDR_## %q0;&BDY_## %q0;&MESS_LST %q0=[remove(get(%q0/MESS_LST),##)];&MASTER_LST #4[0m=[remove(v(MASTER_LST),##)];@switch hasattr(%q0,parent_##)=1,{th [setq(P,get(%q0/parent_##))];&REPLY_%qP %q0=[remove(get(%q0/REPLY_%qP),##)];&PARENT_## %q0}},{@pemit %#=[u(fn_bbprompt)] Either message [u(fn_ord_by_id,%q0,##)] does not exist, or you were not the original poster.}}
+   cmd_+bbreply:1594732685:1594732685::A:$+bbreply */*:@switch [strmatch(%1,*=*)]:[hasattr(#4[0m,bb_post_hdr_%#)]=0:1,{@pemit %#=[u(fn_bbprompt)] You are already in the middle of writing a bbpost (+bbproof to proofread it, +bbtoss to discard).},0:0,{@switch member(u(valid_groups,%#,read),setr(B,u(get_group,%0)))=0,{ @pemit %#=[u(fn_bbprompt)] [switch(%qB,#-2,That Group name is not specific enough.,You do not subscribe to that Group.)]},{@switch t(ulocal(fn_id,%0/%1))=0,{@pemit %#=[u(fn_bbprompt)] Message %0/%1 ([name(%0)]/%1) does not exist.},{th [setq(M,get(%qB/MESS_LST))][setq(I,extract(%qM,%1,1))][setq(I,default(%qB/parent_%qI,%qI))][setq(S,re: [index(get(%qB/hdr_%qI),|,1,1)])];&bb_post_hdr_%# #4[0m=%qB|%qS|reply|%qI;@pemit %#=%rYou start your reply, '%qS' on Group #[member(v(groups),%qB)] ([name(%qB)]).%rYou can now compose the body of the post by using '+bbwrite <text>'%ror '+bb <text>'.  When you are finished, type '+bbpost' by itself.[ifelse(and(hasattr(%#,bb_sig),hasattr(%q0,anonymous)),{%b%bThis is an anonymous group. Your BB_SIG will -not- be appended.},)];}}}
+   cmd_+bbreply2:1594732685:1594732685::A:$+bbreply */*=*:@switch member(u(valid_groups,%#,read),setr(B,u(get_group,%0)))=0,{ @pemit %#=[u(fn_bbprompt)] [switch(%qB,#-2,That Group name is not specific enough.,You do not subscribe to that Group.)]},{@switch t(ulocal(fn_id,%0/%1))=0,{@pemit %#=[u(fn_bbprompt)] Message %0/%1 ([name(%0)]/%1) does not exist.},{th [setq(I,extract(get(%qB/MESS_LST),%1,1))][setq(I,default(%qB/parent_%qI,%qI))];@trigger #4[0m/tr_post_reply=%qB,%qI,%#,%2}}
+   cmd_+bbscan:1594732685:1594732685::A:$+bbscan:@pemit %#=[switch(hasattr(#4[0m,BB_POST_HDR_%#),1,** BB Warning: You are in the middle of writing a bbpost. **%r)][switch(setdiff(iter(setr(0,u(VALID_GROUPS,%#,read)),ulocal(fn_mess_list_threaded,##)),setr(1,get(%#/BB_READ))),,[u(fn_bbprompt)] There are no unread postings on the Global Bulletin Board.,[u(fn_line_cent,Unread Postings on the Global Bulletin Board,78)][setq(9,v(GROUPS))][trim(iter(%q0,switch(setr(2,setdiff(setr(L,ulocal(fn_mess_list_threaded,##)),%q1)),,,%r[u(c,3,name(##))] \(#[member(%q9,##)]\): [words(%q2)] unread \([u(#4[0m/FN_UNREAD_LIST,%q2,%qL,##)]\))),b)]%r[u(fn_line_cent,BBS at [round(mul(fdiv(strlen(v(MASTER_LST)),v(BUFFER_SIZE)),100),1)][v(d_cap)],78)])][ulocal(fn_flags_check,%#)];@pemit %#=[u(fn_bbprompt)] [u(c,2,HINT:)] You can reply directly to a BB posting with +bbreply (eg. '+bbreply 1/3')
+   cmd_+bbsearch:1594732685:1594732685::A:$+bbsearch */*:@switch [member(u(valid_groups,%#,write),setr(0,u(get_group,%0)))]:[hasattr(%q0,anonymous)]:[isdbref(setr(1,locate(%#,*%1,p)))]=0:*:*,{@pemit %#=[u(fn_bbprompt)] BB Group '%0' is either an invalid Group, an unreadable Group, or a Group you do not subscribe to.},1:1:*,{@pemit %#=[u(fn_bbprompt)] BB Group '[name(%q0)]' is an anonymous group.},1:0:0,{@pemit %#=[u(fn_bbprompt)] No such character '%1'.},{@switch words(setr(2,ulocal(fn_sort_b36,iter(grep(%q0,hdr_*,|%q1|),after(##,_)))))=0,{@pemit %#=[u(fn_bbprompt)] [name(%q1)] hasn't posted any messages to the '[name(%q0)]' Group.},{@pemit %#=%r[u(fn_border,78)]%r[center(**** [name(%q0)] ****,78)]%r[space(8)]Message[space(28)]Posted[space(13)]By%r[u(fn_line,78)];@dolist %q2={@pemit %#=[ljust([member(get(#4[0m/groups),%q0)]/[u(fn_ord_by_id,%q0,##)],6)][ljust(u(#4[0m/fn_msg_flags,%#,%q0,##),2)][ljust(index(setr(3,get(%q0/hdr_##)),|,1,1),35)][ljust(u(bbtime_view,index(%q3,|,2,1)),19)][mid([index(%q3,|,3,1)],0,21)][switch(member(%q2,##),words(%q2),%r[u(fn_border,78)])]}}}
+   cmd_+bbtimeout:1594732685:1594732685::A:$+bbtimeout */*=*:@dolist [setq(0,u(#4[0m/get_group,%0))][ulocal(fn_id_list_from_range,%q0,%1)]={@switch [or(strmatch(index(get(%q0/HDR_##),|,4, 1),%#),u(fn_bbs_staff,%#))]:[and(isnum(%2),or(and(gt(%2,0),lte(mul(%2,86400),get(%q0/config_timeout))),and(not(get(%q0/config_timeout)),gte(%2,0)),u(fn_bbs_staff,%#)))]=1:1,{&hdr_## %q0=[replace(get(%q0/hdr_##),5,ifelse(%2,add(secs(),mul(%2,86400)),0),|)];@pemit %#=[u(fn_bbprompt)] Message [u(fn_ord_by_id,%q0,##)] in group '[name(%q0)]' has [ifelse(%2,a %2 day,no)] timeout.},0:*,{@pemit %#=[u(fn_bbprompt)] Either message [u(fn_ord_by_id,%q0,##)] does not exist, or you were not the original poster.},*:0,{@pemit %#=[u(fn_bbprompt)] Sorry, '%2' is not a valid number of days for a timeout on the '[name(%q0)]' board. [ifelse(get(%q0/config_timeout),Maximum timeout is [div(get(%q0/config_timeout),86400)] days.,)]}}
+   cmd_+bbtoss:1594732685:1594732685::A:$+bbtoss:@switch hasattr(#4[0m,bb_post_hdr_%#)=0,{@pemit %#=[u(fn_bbprompt)] You do not have bbpost in progress.},{&bb_post_hdr_%# #4[0m;&bb_post_bdy_%# #4[0m;@pemit %#=[u(fn_bbprompt)] Your bbpost has been discarded.}
+   cmd_+bbversion:1594732685:1594732685::A:$+bbversion:@pemit %#=[u(fn_bbprompt)] Myrddin's BBS v[v(VERSION)] ([v(VERSION_BUILD)])
+   cmd_+bbwrite:1594732685:1594732685::A:$+bbwrite *:@switch hasattr(#4[0m,bb_post_hdr_%#)=0,{@pemit %#=[u(fn_bbprompt)] You do not have a bbpost in progress.},{&bb_post_bdy_%# #4[0m=[get(#4[0m/bb_post_bdy_%#)]%0; @pemit %#=[u(fn_bbprompt)] Text added to bbpost.}
+   cmd_+bbwritelock:1594732685:1594732685::A:$+bbwritelock *=*/*:@switch u(fn_bbs_staff,%#)=1,{@switch member(get(#4[0m/groups),[setq(0,u(#4[0m/get_group,%0))]%q0)=0,{@pemit %#=[u(fn_bbprompt)] No such group as '%0'.},{@switch %1=flag,{&CANWRITE %q0=\[or(u(fn_bbs_staff,\%0),u(fn_bbs_staff,\%0))]},{&CANWRITE %q0=\[or(match(get(\%0/%1),%2),u(fn_bbs_staff,\%0))]}; @pemit %#=[u(fn_bbprompt)] Group '%0' locked. Only people with %1=%2 can write.}},{@pemit %#=[u(fn_bbprompt)] You cannot lock message groups.}
+   credits:1594732685:1594732685::A:Myrddin's BBS was written by Myrddin@everywhere (Elysium, Dreaming, etc). (email: merlin@firstmagic.com). The most recent version of this code can be found at http://www.firstmagic.com.  I hope you continue to get good use out of it! :)
+   description:1594732685:1594732685::A:[iter(setdiff(lattr(me),Desc),ljust(##,18))]
+   do_cleargroup:1594732685:1594732685::A:$+bbconfirm *:@switch v(DELETE_GRP)=[setr(0,u(get_group,%0))],{&groups #4[0m=[remove(v(groups),%q0)];&master_lst #4[0m=[setdiff(v(master_lst),ulocal(fn_mess_list_threaded,%q0))];th [setq(N,name(%q0))];@nuke %q0;&delete_grp #4[0m;@pemit %#=[u(fn_bbprompt)] Group number %0 ([u(c,2,%qN)]) removed.},{&delete_grp #4[0m;@pemit %#=[u(fn_bbprompt)] That group has not been marked for deletion. Use '+bbcleargroup <#>' to mark a group for deletion.}
+}
+obj[6] {
+   obj_created_by:1594732775:1594732775::A:localhost
+   obj_created_date:1594732775:1594732775::A:Tue Jul 14 08:19:35 2020
+   obj_flag:1594732775:1594732775::L:no_command,object
+   obj_home:1594732775:1594732775::A:5
+   obj_last_inhabited:1594732775:1594732775::A:Tue Jul 14 08:19:35 2020
+   obj_location:1594732775:1594732775::A:5
+   obj_money:1594732775:1594732775::A:10
+   obj_name:1594732775:1594732775::A:Announcements
+   obj_owner:1594732775:1594732775::A:0
+   bdy_1:1594733047:1594733047::A:This is just a test message.
+   canread:1594732776:1594732776::A:1
+   canwrite:1594732776:1594732776::A:1
+   config_timeout:1594732776:1594732776::A:2592000
+   hdr_1:1594733047:1594733047::A:Welcome|1594733047|god|#0|1597325047
+   last_mod:1594732776:1594733047::A:1594733047
+   mess_lst:1594733047:1594733047::A:1
+   own:1594732776:1594732776::A:#0
+}
+** Dump Completed Sat Aug 15 20:16:49 2020 **
+server: TeenyMUSH 0.91, version=3.0, change#=0, exported=Mon Aug 17 09:56:56 2020, type=archive_log
+0,setatr,bb_read:1594733047:1597676216::A:1
+** Dump Completed Mon Aug 17 09:56:56 2020 **
+server: TeenyMUSH 0.91, version=3.0, change#=0, exported=Thu Oct 15 16:08:49 2020, type=archive_log
+0,setatr,bb_read:1594733047:1602796129::A:1
+** Dump Completed Thu Oct 15 16:08:49 2020 **
+server: TeenyMUSH 0.91, version=3.0, change#=0, exported=Mon Nov 30 12:01:23 2020, type=archive_log
+0,setatr,bb_read:1594733047:1606759283::A:1
+** Dump Completed Mon Nov 30 12:01:23 2020 **
+server: TeenyMUSH 0.91, version=3.0, change#=0, exported=Mon Nov 30 12:01:26 2020, type=archive_log
+0,setatr,bb_read:1594733047:1606759286::A:1
+** Dump Completed Mon Nov 30 12:01:26 2020 **
+server: TeenyMUSH 0.91, version=3.0, change#=0, exported=Mon Feb  1 16:42:02 2021, type=archive_log
+0,setatr,bb_read:1594733047:1612219322::A:1
+** Dump Completed Mon Feb  1 16:42:02 2021 **
